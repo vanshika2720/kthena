@@ -26,6 +26,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -38,6 +39,7 @@ import (
 	resource "k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/wait"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	listerv1 "k8s.io/client-go/listers/core/v1"
 	k8stesting "k8s.io/client-go/testing"
@@ -971,5 +973,104 @@ func TestPatchDoesNotMutateResourcesInFakeClient(t *testing.T) {
 				gotPrefillCPU.String(), gotPrefillMem.String(),
 				gotDecodeCPU.String(), gotDecodeMem.String(), gotImage)
 		})
+	}
+}
+
+func newAutoscalingPolicyIndexer(objs ...interface{}) cache.Indexer {
+	idx := cache.NewIndexer(cache.MetaNamespaceKeyFunc, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc})
+	for _, o := range objs {
+		_ = idx.Add(o)
+	}
+	return idx
+}
+
+// TestRun_TerminatesOnContextCancel is a regression test for a goroutine leak
+// where AutoscaleController.Run started its reconcile loop with
+// wait.Until(..., nil): the nil stop channel meant the loop never observed
+// context cancellation, so Run could hang forever waiting on caches that
+// never sync. With the fix, Run wires cache sync and the reconcile loop to
+// ctx, so cancelling ctx must let Run return promptly.
+func TestRun_TerminatesOnContextCancel(t *testing.T) {
+	kubeClient := k8sfake.NewSimpleClientset()
+	client := clientfake.NewSimpleClientset()
+	ac := NewAutoscaleController(kubeClient, client, 0)
+	if ac == nil {
+		t.Fatal("NewAutoscaleController returned nil")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		ac.Run(ctx)
+	}()
+
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after context cancellation")
+	}
+}
+
+// TestReconcileLoop_StopsInvokingAfterContextCancel is a regression test for
+// the same goroutine leak, targeted at the reconcile loop itself. It
+// exercises the exact wait.UntilWithContext wiring used by
+// AutoscaleController.Run, with a real AutoscaleController.Reconcile bound to
+// fake clients and a short, controllable period so the assertions don't
+// depend on the production sync interval. Because the loop's own select races
+// ctx.Done() against the period timer, cancelling ctx stops the loop (and
+// therefore stops invoking Reconcile) almost immediately regardless of how
+// long the period is. That lets the test detect loop termination via channel
+// synchronization instead of sleeping past the real sync period or
+// inspecting runtime.NumGoroutine().
+func TestReconcileLoop_StopsInvokingAfterContextCancel(t *testing.T) {
+	client := clientfake.NewSimpleClientset()
+	ac := &AutoscaleController{
+		client:                    client,
+		autoscalingPoliciesLister: workloadLister.NewAutoscalingPolicyLister(newAutoscalingPolicyIndexer()),
+		scalerMap:                 map[string]*autoscalerAutoscaler{},
+		optimizerMap:              map[string]*autoscalerOptimizer{},
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var calls int32
+	invoked := make(chan struct{}, 1)
+	loopDone := make(chan struct{})
+
+	go func() {
+		defer close(loopDone)
+		wait.UntilWithContext(ctx, func(ctx context.Context) {
+			ac.Reconcile(ctx)
+			atomic.AddInt32(&calls, 1)
+			select {
+			case invoked <- struct{}{}:
+			default:
+			}
+		}, 10*time.Millisecond)
+	}()
+
+	select {
+	case <-invoked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the first reconcile invocation")
+	}
+
+	cancel()
+
+	select {
+	case <-loopDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reconcile loop did not stop after context cancellation")
+	}
+
+	callsAtStop := atomic.LoadInt32(&calls)
+	select {
+	case <-invoked:
+		t.Fatalf("reconcile invoked again after context cancellation (call count was %d when the loop stopped)", callsAtStop)
+	default:
 	}
 }
