@@ -374,6 +374,19 @@ class AIPerfRunnerTest(unittest.TestCase):
 
         self.assertNotIn("aiperf_cancelled", metrics)
 
+    def test_read_metrics_from_output_raises_when_summary_missing(self):
+        # AIPerf reported success (subprocess.run(check=True) did not raise)
+        # but never wrote profile_export_aiperf.json. This must not silently
+        # read as {} — it has to surface as a framework error so the run
+        # cannot be mistaken for a zero-metric but otherwise valid measurement.
+        run_dir = Path(tempfile.mkdtemp())
+        # No profile_export_aiperf.json written.
+
+        with self.assertRaises(ab_test.AIPerfOutputMissingError) as ctx:
+            self.runner._read_metrics_from_output(run_dir)
+
+        self.assertIn("profile_export_aiperf.json", str(ctx.exception))
+
 
 class BackendsConfigTest(unittest.TestCase):
     def test_profile_resources_are_parsed_from_yaml_dict(self):
@@ -662,6 +675,37 @@ class OrchestratorPprofTest(unittest.TestCase):
         self.assertEqual(result.verdict["status"], "framework_error")
         self.collector.start_pprof_collection.return_value.abandon.assert_called_once()
 
+    def test_missing_aiperf_summary_is_framework_error_not_valid(self):
+        # AIPerf itself exits 0 (no CalledProcessError), but its metrics
+        # reader could not find profile_export_aiperf.json. This must be
+        # classified as a framework error, distinguishable from a
+        # request-level AIPerf error (e.g. aiperf_genuine_errors) and must
+        # not be reported as a valid, zero-metric run.
+        self.runner.run.side_effect = ab_test.AIPerfOutputMissingError(
+            "AIPerf reported successful execution but "
+            ".../config_a/profile_export_aiperf.json is missing; "
+            "no metrics can be read for this run"
+        )
+
+        orch = ab_test.ABTestOrchestrator.__new__(ab_test.ABTestOrchestrator)
+        orch.scenario = self.scenario
+        orch.k8s = self.k8s
+        orch.runner = self.runner
+        orch.collector = self.collector
+        orch.router_config_a_path = mock.MagicMock()
+        orch.router_config_b_path = mock.MagicMock()
+        orch.output_dir = mock.MagicMock()
+
+        result = orch.run_single_config("a.yaml", "config_a")
+
+        self.assertEqual(result.verdict["status"], ab_test.VERDICT_FRAMEWORK_ERROR)
+        self.assertEqual(result.metrics, {})
+        reasons = result.verdict["reasons"]
+        self.assertEqual(len(reasons), 1)
+        self.assertIn("profile_export_aiperf.json", reasons[0])
+        self.assertIn("profile_export_aiperf.json", result.raw_output)
+        self.collector.start_pprof_collection.return_value.abandon.assert_called_once()
+
 
 class MainTest(unittest.TestCase):
     def test_main_exits_non_zero_when_report_contains_regression(self):
@@ -735,6 +779,36 @@ class MainTest(unittest.TestCase):
                     ab_test.main()
 
         self.assertEqual(exit_ctx.exception.code, 0)
+
+    def test_main_does_not_exit_zero_when_comparison_skipped_for_framework_error(self):
+        # A missing AIPerf summary (or any other framework_error run) marks
+        # the comparison "_skipped" (see ResultReporter.compare); main() must
+        # not treat that as a clean, regression-free run.
+        report = {
+            "comparison": {
+                "_skipped": True,
+                "reason": "config_a verdict is 'framework_error'; comparison requires both runs to be valid",
+            },
+            "router_comparison": {},
+        }
+        args = mock.Mock(
+            scenario="scenario.yaml",
+            router_config_a="config-a.yaml",
+            router_config_b="config-b.yaml",
+            output="./results",
+            local_port=ab_test.K8sManager.DEFAULT_LOCAL_PORT,
+            dry_run=False,
+        )
+        parser = mock.Mock()
+        parser.parse_args.return_value = args
+
+        with mock.patch.object(ab_test, "ABTestOrchestrator") as orchestrator_cls:
+            orchestrator_cls.return_value.run.return_value = report
+            with mock.patch.object(ab_test, "build_parser", return_value=parser):
+                with self.assertRaises(SystemExit) as exit_ctx:
+                    ab_test.main()
+
+        self.assertEqual(exit_ctx.exception.code, 2)
 
     @mock.patch("router_ab_test.kubernetes.K8sManager")
     @mock.patch.object(ab_test, "ScenarioConfig")

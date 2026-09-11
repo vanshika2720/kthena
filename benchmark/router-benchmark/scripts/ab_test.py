@@ -36,6 +36,7 @@ from router_ab_test import (
     VERDICT_INVALID,
     VERDICT_VALID,
     ABTestOrchestrator,
+    AIPerfOutputMissingError,
     AIPerfRunner,
     BenchmarkResult,
     EndpointMode,
@@ -53,6 +54,7 @@ from router_ab_test import (
 
 __all__ = [
     "ABTestOrchestrator",
+    "AIPerfOutputMissingError",
     "AIPerfRunner",
     "BenchmarkResult",
     "EndpointMode",

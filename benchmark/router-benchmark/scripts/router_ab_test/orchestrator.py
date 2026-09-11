@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from router_ab_test.kubernetes import EndpointMode, K8sManager
-from router_ab_test.load_generator import AIPerfRunner
+from router_ab_test.load_generator import AIPerfOutputMissingError, AIPerfRunner
 from router_ab_test.metrics_collector import MetricsCollector
 from router_ab_test.models import (
     VERDICT_FRAMEWORK_ERROR,
@@ -79,21 +79,30 @@ class ABTestOrchestrator:
                 router_endpoint=router_endpoint,
                 extra_args=self.scenario.aiperf.get("extraArgs"),
             )
-        except subprocess.CalledProcessError as exc:
+        except (subprocess.CalledProcessError, AIPerfOutputMissingError) as exc:
             # Benchmark tooling itself failed — the run is not a measurement
-            # and must not be judged against backend stability signals.
+            # and must not be judged against backend stability signals. This
+            # covers both a non-zero AIPerf exit and AIPerf exiting 0 without
+            # producing a summary to read metrics from (issue: a missing
+            # profile_export_aiperf.json must not silently read as {} and
+            # let an unmeasured run pass as valid).
             if pprof_handle is not None:
                 pprof_handle.abandon()
+            reason = (
+                f"aiperf exited with code {exc.returncode}"
+                if isinstance(exc, subprocess.CalledProcessError)
+                else str(exc)
+            )
             result = BenchmarkResult(
                 config_name=config_name,
                 scenario=self.scenario.name,
                 timestamp="",
                 metrics={},
-                raw_output=f"aiperf exited with code {exc.returncode}",
+                raw_output=reason,
                 artifacts={},
                 verdict={
                     "status": VERDICT_FRAMEWORK_ERROR,
-                    "reasons": [f"aiperf exited with code {exc.returncode}"],
+                    "reasons": [reason],
                     "offenders": [],
                     "restart_stats": {},
                 },

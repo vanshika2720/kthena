@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from router_ab_test.kubernetes import EndpointMode, K8sManager, MockerDeploymentBuilder
-from router_ab_test.load_generator import AIPerfRunner
+from router_ab_test.load_generator import AIPerfOutputMissingError, AIPerfRunner
 from router_ab_test.metrics_collector import MetricsCollector, PprofCollection
 from router_ab_test.models import (
     VERDICT_FRAMEWORK_ERROR,
@@ -31,6 +31,7 @@ from router_ab_test.reporter import ResultReporter, analyze_router_metrics, form
 
 __all__ = [
     "ABTestOrchestrator",
+    "AIPerfOutputMissingError",
     "AIPerfRunner",
     "BackendProfile",
     "BackendsConfig",

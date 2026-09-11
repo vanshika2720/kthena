@@ -39,6 +39,18 @@ _AIPERF_METRIC_MAP = {
 _PHASE_CANCELLED_RE = re.compile(r"Phase profiling complete \|.*\bcancelled=(\d+)")
 
 
+class AIPerfOutputMissingError(RuntimeError):
+    """AIPerf exited successfully but its summary artifact is missing.
+
+    This is a framework/tooling failure, not a request-level AIPerf error:
+    the process reported success yet produced no
+    ``profile_export_aiperf.json`` to read metrics from, so the run has no
+    measurement to report and must not be treated as a valid comparison
+    input (see ``ABTestOrchestrator.run_single_config``, which maps this to
+    ``VERDICT_FRAMEWORK_ERROR`` the same way it does a non-zero AIPerf exit).
+    """
+
+
 class AIPerfRunner:
     """Run AIPerf benchmarks against the router endpoint."""
 
@@ -207,8 +219,10 @@ class AIPerfRunner:
         """Parse aiperf's aggregated JSON output (profile_export_aiperf.json)."""
         summary_path = run_dir / "profile_export_aiperf.json"
         if not summary_path.exists():
-            print(f"  WARNING: {summary_path} not found; metrics will be empty")
-            return {}
+            raise AIPerfOutputMissingError(
+                f"AIPerf reported successful execution but {summary_path} is missing; "
+                "no metrics can be read for this run"
+            )
 
         with summary_path.open(encoding="utf-8") as file:
             data = json.load(file)
