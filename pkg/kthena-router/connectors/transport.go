@@ -30,6 +30,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/common"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/handlers"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/providers"
 	"k8s.io/klog/v2"
 )
 
@@ -104,6 +105,26 @@ func decoderProxy(c *gin.Context, req *http.Request, timeout time.Duration) (int
 	// Determine if this is a streaming response
 	stream := isStreamingResponse(resp)
 
+	// The OpenAI Responses API uses a different usage shape
+	// (input_tokens/output_tokens) and streaming terminal events
+	// (response.completed/incomplete/failed, no `data: [DONE]`). Route it through
+	// the shared provider response parser instead of the Chat Completions helpers.
+	if isResponsesPath(req.URL.Path) {
+		parser := providers.DefaultAdapter().ResponseParser(c, req.URL.Path)
+		if stream {
+			outputTokens, err := handleResponsesStreamingResponse(c, resp, parser)
+			if err != nil {
+				return outputTokens, fmt.Errorf("streaming decode interrupted: %w", err)
+			}
+			return outputTokens, nil
+		}
+		outputTokens, err := handleResponsesNonStreamingResponse(c, resp, parser)
+		if err != nil {
+			return 0, fmt.Errorf("non-streaming decode interrupted: %w", err)
+		}
+		return outputTokens, nil
+	}
+
 	if stream {
 		// Handle streaming response
 		outputTokens, err := handleStreamingResponse(c, resp)
@@ -121,11 +142,19 @@ func decoderProxy(c *gin.Context, req *http.Request, timeout time.Duration) (int
 	}
 }
 
-// preparePrefillBody modifies a request body for a prefill request.
-// It removes streaming options and sets the token counts appropriately.
-func preparePrefillBody(reqBody map[string]interface{}) {
+// preparePrefillBody modifies a request body for a PD-disaggregated prefill
+// request: it disables streaming and caps the prefill output to a single token.
+// The output-cap field is protocol-specific: the OpenAI Responses API uses
+// max_output_tokens, while Chat Completions uses max_tokens (and
+// max_completion_tokens when the client already set it).
+func preparePrefillBody(reqBody map[string]interface{}, path string) {
 	delete(reqBody, "stream")
 	delete(reqBody, "stream_options")
+
+	if isResponsesPath(path) {
+		reqBody["max_output_tokens"] = 1
+		return
+	}
 
 	reqBody["max_tokens"] = 1
 	if reqBody["max_completion_tokens"] != nil {
@@ -135,7 +164,7 @@ func preparePrefillBody(reqBody map[string]interface{}) {
 
 func buildPrefillRequest(req *http.Request, modelRequest map[string]interface{}) *http.Request {
 	// In PD disaggregated mode, we need to send a prefill request to the prefill pod with non stream mode.
-	preparePrefillBody(modelRequest)
+	preparePrefillBody(modelRequest, req.URL.Path)
 
 	body, err := json.Marshal(modelRequest)
 	if err != nil {
@@ -152,10 +181,29 @@ func buildPrefillRequest(req *http.Request, modelRequest map[string]interface{})
 }
 
 func BuildDecodeRequest(c *gin.Context, req *http.Request, modelRequest map[string]interface{}) *http.Request {
-	modelRequest = AddTokenUsage(c, modelRequest)
-	body, err := json.Marshal(modelRequest)
-	if err != nil {
-		return nil
+	var body []byte
+	if isResponsesPath(req.URL.Path) {
+		// OpenAI Responses API: stream_options.include_usage / include_usage are
+		// Chat Completions fields and must never be injected. When the parsed
+		// request still matches the original body (no model rewrite) replay that
+		// body verbatim so opaque Responses fields are preserved byte-for-byte;
+		// otherwise re-marshal the parsed map, which changes only the model.
+		if raw, ok := unmutatedResponsesBody(c, modelRequest); ok {
+			body = raw
+		} else {
+			marshaled, err := json.Marshal(modelRequest)
+			if err != nil {
+				return nil
+			}
+			body = marshaled
+		}
+	} else {
+		modelRequest = AddTokenUsage(c, modelRequest)
+		marshaled, err := json.Marshal(modelRequest)
+		if err != nil {
+			return nil
+		}
+		body = marshaled
 	}
 
 	reqCopy := req.Clone(req.Context())
@@ -166,9 +214,53 @@ func BuildDecodeRequest(c *gin.Context, req *http.Request, modelRequest map[stri
 	return reqCopy
 }
 
+// isResponsesPath reports whether p targets the OpenAI Responses API endpoint.
+// It mirrors the exact-match convention used by the provider adapters.
+func isResponsesPath(p string) bool {
+	return p == "/v1/responses"
+}
+
+// unmutatedResponsesBody returns the original raw request body when it is
+// available on the gin context and still consistent with modelRequest (i.e. the
+// model was not rewritten). It lets BuildDecodeRequest forward a Responses
+// request byte-for-byte instead of re-marshalling the parsed map. It reports
+// false whenever the raw body is missing or no longer matches, so the caller
+// falls back to marshalling modelRequest.
+func unmutatedResponsesBody(c *gin.Context, modelRequest map[string]interface{}) ([]byte, bool) {
+	if c == nil {
+		return nil, false
+	}
+	raw, exists := c.Get(common.RawRequestBodyKey)
+	if !exists {
+		return nil, false
+	}
+	rawBody, ok := raw.([]byte)
+	if !ok || len(rawBody) == 0 {
+		return nil, false
+	}
+	var original struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(rawBody, &original); err != nil {
+		return nil, false
+	}
+	model, _ := modelRequest["model"].(string)
+	if model != original.Model {
+		return nil, false
+	}
+	return rawBody, true
+}
+
 // AddTokenUsage adds token usage to the request body if it is not already present
 // should be used for decode requests or non PD disaggregated mode
 func AddTokenUsage(c *gin.Context, reqBody map[string]interface{}) map[string]interface{} {
+	// The OpenAI Responses API returns usage natively (in the response body and
+	// the response.completed/incomplete/failed terminal events), and
+	// include_usage / stream_options are not valid Responses request fields.
+	// Never inject them; Chat Completions paths are unaffected.
+	if c != nil && c.Request != nil && isResponsesPath(c.Request.URL.Path) {
+		return reqBody
+	}
 	// Check if streaming is enabled
 	if isStreamingRequest(reqBody) {
 		if !isTokenUsageEnabled(reqBody) {
@@ -278,5 +370,59 @@ func handleNonStreamingResponse(c *gin.Context, resp *http.Response) (int, error
 		return parsed.Usage.CompletionTokens, nil
 	}
 
+	return 0, nil
+}
+
+// handleResponsesStreamingResponse forwards an OpenAI Responses SSE stream
+// verbatim and returns the output-token count reported by the terminal event.
+// It does not rely on a `data: [DONE]` marker; parser.FinalStreamUsage reports
+// usage once a response.completed/incomplete/failed event has been seen.
+func handleResponsesStreamingResponse(c *gin.Context, resp *http.Response, parser providers.ResponseUsageParser) (int, error) {
+	reader := bufio.NewReader(resp.Body)
+	var streamErr error
+	c.Stream(func(w io.Writer) bool {
+		line, err := reader.ReadBytes('\n')
+		if len(line) > 0 {
+			parser.ParseStreamLine(string(line))
+			if _, writeErr := w.Write(line); writeErr != nil {
+				klog.Errorf("error writing stream body: %v", writeErr)
+				streamErr = writeErr
+				return false
+			}
+			parser.RecordStreamLineWritten(string(line))
+		}
+		if err != nil {
+			if err != io.EOF {
+				klog.Errorf("error reading stream body: %v", err)
+				streamErr = err
+			}
+			return false
+		}
+		return true
+	})
+
+	if usage, ok := parser.FinalStreamUsage(); ok {
+		klog.V(4).Infof("Parsed usage: %+v", usage)
+		return usage.CompletionTokens, streamErr
+	}
+	return 0, streamErr
+}
+
+// handleResponsesNonStreamingResponse forwards a non-streaming OpenAI Responses
+// body verbatim and extracts input_tokens/output_tokens/total_tokens via the
+// shared provider parser.
+func handleResponsesNonStreamingResponse(c *gin.Context, resp *http.Response, parser providers.ResponseUsageParser) (int, error) {
+	var buf bytes.Buffer
+	teeReader := io.TeeReader(resp.Body, &buf)
+
+	if _, err := io.Copy(c.Writer, teeReader); err != nil {
+		klog.Errorf("copy response to downstream failed: %v", err)
+		return 0, err
+	}
+
+	if usage, ok := parser.ParseBody(buf.Bytes()); ok {
+		klog.V(4).Infof("Parsed usage: %+v", usage)
+		return usage.CompletionTokens, nil
+	}
 	return 0, nil
 }
