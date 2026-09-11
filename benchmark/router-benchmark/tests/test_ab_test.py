@@ -536,6 +536,29 @@ class MetricsCollectorTest(unittest.TestCase):
         fetch_text.assert_not_called()
         fetch_bytes.assert_not_called()
 
+    def test_collect_artifacts_records_prometheus_fetch_error_without_raising(self):
+        # A metrics-scrape failure (unreachable endpoint, non-200, timeout)
+        # must not crash a run whose AIPerf measurement already succeeded —
+        # it's optional instrumentation, not the measurement itself. Mirrors
+        # how pprof failures are already captured as {"error": ...} instead
+        # of propagating.
+        scenario = ab_test.ScenarioConfig(
+            name="smoke-test-s2-latency-vs-qps",
+            description="scenario",
+            load={"duration": "60s"},
+            backends={},
+            metrics={"prometheus": True},
+        )
+
+        with mock.patch.object(self.collector, "_fetch_text", side_effect=OSError("boom")):
+            artifacts = self.collector.collect_artifacts(
+                config_name="config_a",
+                scenario=scenario,
+                router_metrics_endpoint="localhost:19090",
+            )
+
+        self.assertIn("boom", artifacts["prometheus"]["error"])
+
     def test_start_pprof_collection_fetches_profiles(self):
         fetched = []
 
@@ -654,6 +677,30 @@ class OrchestratorPprofTest(unittest.TestCase):
         self.assertIs(
             self.collector.collect_artifacts.call_args.kwargs["pprof_handle"],
             self.collector.start_pprof_collection.return_value,
+        )
+
+    def test_collect_artifacts_uses_dedicated_metrics_endpoint_not_main_router_endpoint(self):
+        # /metrics is no longer served on the main inference listener by
+        # default (router.go's ExposeMetricsOnRouterPort defaults false), so
+        # collect_artifacts must be given the dedicated metrics-Service
+        # endpoint, not the main router_endpoint used for chat/completions.
+        self.k8s.get_router_endpoint.return_value = "localhost:8080"
+        self.k8s.get_router_metrics_endpoint.return_value = "localhost:19090"
+
+        orch = ab_test.ABTestOrchestrator.__new__(ab_test.ABTestOrchestrator)
+        orch.scenario = self.scenario
+        orch.k8s = self.k8s
+        orch.runner = self.runner
+        orch.collector = self.collector
+        orch.router_config_a_path = mock.MagicMock()
+        orch.router_config_b_path = mock.MagicMock()
+        orch.output_dir = mock.MagicMock()
+
+        orch.run_single_config("a.yaml", "config_a")
+
+        self.assertEqual(
+            self.collector.collect_artifacts.call_args.kwargs["router_metrics_endpoint"],
+            "localhost:19090",
         )
 
     def test_aiperf_failure_abandons_pprof_handle(self):
@@ -1349,6 +1396,42 @@ class K8sManagerRestartStatsTest(unittest.TestCase):
             stats = k8s.get_mocker_pod_restart_stats()
         self.assertEqual(stats["total_restarts"], 0)
         self.assertEqual(stats["pods"], [])
+
+
+class K8sManagerMetricsEndpointTest(unittest.TestCase):
+    """get_router_metrics_endpoint() must target the dedicated metrics
+    Service, not the main inference listener (which no longer serves
+    /metrics by default — see router.go's ExposeMetricsOnRouterPort)."""
+
+    def test_targets_dedicated_metrics_service_not_main_router_endpoint(self):
+        from router_ab_test.kubernetes import K8sManager
+
+        k8s = K8sManager()
+        with mock.patch.object(k8s, "_start_port_forward", return_value="localhost:19090") as start_pf:
+            endpoint = k8s.get_router_metrics_endpoint()
+
+        self.assertEqual(endpoint, "localhost:19090")
+        start_pf.assert_called_once_with(
+            process_attr="_metrics_pf_proc",
+            local_port=K8sManager.DEFAULT_METRICS_LOCAL_PORT,
+            remote_port=K8sManager.ROUTER_METRICS_SVC_PORT,
+            description=f"svc/{K8sManager.ROUTER_METRICS_SVC_NAME}:{K8sManager.ROUTER_METRICS_SVC_PORT}",
+            target_name=K8sManager.ROUTER_METRICS_SVC_NAME,
+        )
+        self.assertNotEqual(K8sManager.ROUTER_METRICS_SVC_NAME, K8sManager.ROUTER_SVC_NAME)
+
+    def test_cleanup_port_forward_stops_metrics_port_forward(self):
+        from router_ab_test.kubernetes import K8sManager
+
+        k8s = K8sManager()
+        fake_proc = mock.Mock()
+        fake_proc.poll.return_value = None
+        k8s._metrics_pf_proc = fake_proc
+
+        k8s.cleanup_port_forward()
+
+        fake_proc.terminate.assert_called_once()
+        self.assertIsNone(k8s._metrics_pf_proc)
 
 
 class TempManifestCleanupTest(unittest.TestCase):

@@ -217,8 +217,16 @@ class K8sManager:
     ROUTER_SVC_PORT = 80
     ROUTER_SVC_NAME = "kthena-router"
     ROUTER_DEBUG_PORT = 15000
+    # Dedicated metrics Service (charts/kthena/charts/networking/templates/
+    # kthena-router/component/service.yaml). /metrics is no longer served on
+    # the main inference port by default (--expose-metrics-on-router-port
+    # defaults to false as of the "harden observability endpoints" change),
+    # so artifact collection must reach it here instead.
+    ROUTER_METRICS_SVC_NAME = "kthena-router-metrics"
+    ROUTER_METRICS_SVC_PORT = 9090
     DEFAULT_LOCAL_PORT = 8080
     DEFAULT_DEBUG_LOCAL_PORT = 18080
+    DEFAULT_METRICS_LOCAL_PORT = 19090
     MOCKER_NAMESPACE = "default"
     MOCKER_DEPLOYMENT = "mocker-llm"
     _MOCKER_LABEL_SELECTOR = "app=mocker-llm"
@@ -228,14 +236,17 @@ class K8sManager:
         namespace: str = "default",
         local_port: int = DEFAULT_LOCAL_PORT,
         debug_local_port: int = DEFAULT_DEBUG_LOCAL_PORT,
+        metrics_local_port: int = DEFAULT_METRICS_LOCAL_PORT,
         endpoint_mode: str = EndpointMode.PORT_FORWARD,
     ):
         self.namespace = namespace
         self.local_port = local_port
         self.debug_local_port = debug_local_port
+        self.metrics_local_port = metrics_local_port
         self.endpoint_mode = endpoint_mode
         self._pf_proc: subprocess.Popen[str] | None = None
         self._debug_pf_proc: subprocess.Popen[str] | None = None
+        self._metrics_pf_proc: subprocess.Popen[str] | None = None
         self._builder = MockerDeploymentBuilder(namespace=self.MOCKER_NAMESPACE)
 
     # Mapping from scenario engineType (lowercase) to Kthena CRD InferenceEngine.
@@ -481,12 +492,28 @@ class K8sManager:
             target_type="deployment",
         )
 
+    def get_router_metrics_endpoint(self) -> str:
+        """Port-forward the dedicated kthena-router-metrics Service.
+
+        /metrics lives on its own Service/port, not the main inference
+        listener (see ROUTER_METRICS_SVC_NAME above) — this must not reuse
+        get_router_endpoint()'s target.
+        """
+        return self._start_port_forward(
+            process_attr="_metrics_pf_proc",
+            local_port=self.metrics_local_port,
+            remote_port=self.ROUTER_METRICS_SVC_PORT,
+            description=f"svc/{self.ROUTER_METRICS_SVC_NAME}:{self.ROUTER_METRICS_SVC_PORT}",
+            target_name=self.ROUTER_METRICS_SVC_NAME,
+        )
+
     # ---- Port-forward lifecycle -----------------------------------------------
 
     def cleanup_port_forward(self) -> None:
         if self.endpoint_mode == EndpointMode.PORT_FORWARD:
             self._stop_port_forward("_pf_proc")
         self._stop_port_forward("_debug_pf_proc")
+        self._stop_port_forward("_metrics_pf_proc")
 
     def _start_port_forward(
         self,
@@ -495,6 +522,7 @@ class K8sManager:
         remote_port: int,
         description: str,
         target_type: str = "svc",
+        target_name: str | None = None,
     ) -> str:
         existing_proc = getattr(self, process_attr)
         if existing_proc is not None and existing_proc.poll() is None:
@@ -503,7 +531,7 @@ class K8sManager:
         local_endpoint = f"localhost:{local_port}"
         print(f"  Starting port-forward ({local_endpoint} → {description})")
 
-        target = f"{target_type}/{self.ROUTER_DEPLOYMENT}"
+        target = f"{target_type}/{target_name or self.ROUTER_DEPLOYMENT}"
         proc = subprocess.Popen(
             [
                 "kubectl", "port-forward", target,

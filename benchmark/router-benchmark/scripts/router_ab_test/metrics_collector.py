@@ -106,7 +106,10 @@ class MetricsCollector:
 
         artifacts: dict[str, Any] = {}
         if metrics_config.get("prometheus", False):
-            artifacts["prometheus"] = self._collect_prometheus(config_dir, router_metrics_endpoint)
+            try:
+                artifacts["prometheus"] = self._collect_prometheus(config_dir, router_metrics_endpoint)
+            except Exception as exc:  # noqa: BLE001 — optional artifact, must never kill a valid run
+                artifacts["prometheus"] = {"error": f"{type(exc).__name__}: {exc}"}
         if pprof_handle is not None:
             join_timeout = int(metrics_config.get("cpuProfileSeconds", _DEFAULT_CPU_PROFILE_SECONDS)) + 60
             artifacts["pprof"] = pprof_handle.result(timeout=join_timeout)
