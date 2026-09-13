@@ -410,6 +410,25 @@ var problematicWaitingReasons = map[string]bool{
 
 const maxPodFailureMessageLen = 300
 
+// conditionReasonPattern is the ModelServing condition Reason field's CRD validation
+// (metav1.Condition.Reason): pattern ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$, minLength 1.
+var conditionReasonPattern = regexp.MustCompile(`^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$`)
+
+// sanitizeReason returns reason unchanged if it satisfies conditionReasonPattern, and fallback
+// otherwise (this also covers an empty reason, since the pattern requires at least one char).
+// Pod/scheduler-reported reasons (PodScheduled condition Reason, container Terminated and
+// LastTerminationState.Terminated Reason, pod.Status.Reason) are free-form strings with no such
+// contract - a hyphen or space in any of them would otherwise reach PodFailureDetail.Reason and,
+// from there, the ModelServing condition Reason, causing the API server to reject the entire
+// status update rather than just carrying a bad reason. fallback must itself already be a valid
+// condition reason (all current callers pass one of our own stable hardcoded identifiers).
+func sanitizeReason(reason, fallback string) string {
+	if conditionReasonPattern.MatchString(reason) {
+		return reason
+	}
+	return fallback
+}
+
 // PodFailureDetail describes an actionable Pod-level failure extracted from live Pod status.
 type PodFailureDetail struct {
 	// Reason is a stable, programmatic identifier for the failure: either a well-known
@@ -436,10 +455,7 @@ func ExtractPodFailureDetail(pod *corev1.Pod) (PodFailureDetail, bool) {
 	if pod.Status.Phase == corev1.PodPending {
 		for _, cond := range pod.Status.Conditions {
 			if cond.Type == corev1.PodScheduled && cond.Status == corev1.ConditionFalse {
-				reason := cond.Reason
-				if reason == "" {
-					reason = string(corev1.PodReasonUnschedulable)
-				}
+				reason := sanitizeReason(cond.Reason, string(corev1.PodReasonUnschedulable))
 				return PodFailureDetail{
 					Reason:  reason,
 					Message: truncatePodFailureMessage(fmt.Sprintf("pod %s: %s", pod.Name, cond.Message)),
@@ -462,10 +478,7 @@ func ExtractPodFailureDetail(pod *corev1.Pod) (PodFailureDetail, bool) {
 
 	// Pod already terminated in failure without a more specific per-container signal.
 	if pod.Status.Phase == corev1.PodFailed {
-		reason := pod.Status.Reason
-		if reason == "" {
-			reason = "PodFailed"
-		}
+		reason := sanitizeReason(pod.Status.Reason, "PodFailed")
 		return PodFailureDetail{
 			Reason:  reason,
 			Message: truncatePodFailureMessage(fmt.Sprintf("pod %s failed: %s", pod.Name, pod.Status.Message)),
@@ -489,10 +502,7 @@ func extractContainerFailure(podName string, statuses []corev1.ContainerStatus, 
 					status.State.Waiting.Message)),
 			}, true
 		case status.State.Terminated != nil && status.State.Terminated.ExitCode != 0:
-			reason := status.State.Terminated.Reason
-			if reason == "" {
-				reason = "Error"
-			}
+			reason := sanitizeReason(status.State.Terminated.Reason, "Error")
 			return PodFailureDetail{
 				Reason: reason,
 				Message: truncatePodFailureMessage(fmt.Sprintf("pod %s %s %s exited with code %d: %s", podName, kind,
@@ -500,10 +510,7 @@ func extractContainerFailure(podName string, statuses []corev1.ContainerStatus, 
 			}, true
 		case status.RestartCount > 0 && status.LastTerminationState.Terminated != nil:
 			last := status.LastTerminationState.Terminated
-			reason := last.Reason
-			if reason == "" {
-				reason = "ContainerRestarted"
-			}
+			reason := sanitizeReason(last.Reason, "ContainerRestarted")
 			return PodFailureDetail{
 				Reason: reason,
 				Message: truncatePodFailureMessage(fmt.Sprintf("pod %s %s %s restarted %d time(s), last exit code %d: %s",

@@ -350,6 +350,73 @@ func TestExtractPodFailureDetail(t *testing.T) {
 			},
 			expectFailure: false,
 		},
+		// The following four cases each cover one of the untrusted, unstructured Pod/scheduler
+		// fields (PodScheduled condition Reason, container Terminated Reason,
+		// LastTerminationState.Terminated Reason, pod.Status.Reason) that the CRD's condition
+		// Reason validation (^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$) does not allow through
+		// unchecked: a hyphen or space in any of them would otherwise make the whole
+		// ModelServing status update rejected by the API server instead of just carrying a bad
+		// reason. Each must fall back to the same identifier already used for an empty reason.
+		{
+			name: "invalid PodScheduled reason falls back to Unschedulable",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "p"},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodPending,
+					Conditions: []corev1.PodCondition{
+						{Type: corev1.PodScheduled, Status: corev1.ConditionFalse, Reason: "failed to schedule", Message: "0/3 nodes are available: insufficient cpu"},
+					},
+				},
+			},
+			expectFailure:  true,
+			expectedReason: "Unschedulable",
+		},
+		{
+			name: "invalid container Terminated reason falls back to Error",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "p"},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodPending,
+					InitContainerStatuses: []corev1.ContainerStatus{
+						{Name: "downloader", State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+							ExitCode: 1, Reason: "Image Pull Error", Message: "model path not found",
+						}}},
+					},
+				},
+			},
+			expectFailure:  true,
+			expectedReason: "Error",
+		},
+		{
+			name: "invalid LastTerminationState reason falls back to ContainerRestarted",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "p"},
+				Status: corev1.PodStatus{
+					Phase: corev1.PodRunning,
+					ContainerStatuses: []corev1.ContainerStatus{
+						{
+							Name:         "engine",
+							RestartCount: 1,
+							State:        corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+							LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+								Reason: "Some-Invalid-Reason", ExitCode: 137,
+							}},
+						},
+					},
+				},
+			},
+			expectFailure:  true,
+			expectedReason: "ContainerRestarted",
+		},
+		{
+			name: "invalid pod.Status.Reason falls back to PodFailed",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: "p"},
+				Status:     corev1.PodStatus{Phase: corev1.PodFailed, Reason: "node not-ready"},
+			},
+			expectFailure:  true,
+			expectedReason: "PodFailed",
+		},
 	}
 
 	for _, tt := range tests {
@@ -360,7 +427,29 @@ func TestExtractPodFailureDetail(t *testing.T) {
 				assert.Equal(t, tt.expectedReason, detail.Reason)
 				assert.NotEmpty(t, detail.Message)
 				assert.Contains(t, detail.Message, "p")
+				// Whatever the source field looked like, the extracted Reason must always be
+				// safe to write into the ModelServing condition's CRD-validated Reason field.
+				assert.Regexp(t, conditionReasonPattern, detail.Reason)
 			}
+		})
+	}
+}
+
+func TestSanitizeReason(t *testing.T) {
+	tests := []struct {
+		name     string
+		reason   string
+		fallback string
+		want     string
+	}{
+		{name: "valid reason is returned unchanged", reason: "ImagePullBackOff", fallback: "Error", want: "ImagePullBackOff"},
+		{name: "reason with a space falls back", reason: "Image Pull Error", fallback: "Error", want: "Error"},
+		{name: "reason with a hyphen falls back", reason: "failed-to-schedule", fallback: "Unschedulable", want: "Unschedulable"},
+		{name: "empty reason falls back", reason: "", fallback: "PodFailed", want: "PodFailed"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, sanitizeReason(tt.reason, tt.fallback))
 		})
 	}
 }
