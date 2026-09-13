@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"math"
 	"sort"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -35,7 +34,6 @@ import (
 	"k8s.io/apimachinery/pkg/selection"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
 	kubefake "k8s.io/client-go/kubernetes/fake"
 	corelisters "k8s.io/client-go/listers/core/v1"
@@ -2800,10 +2798,12 @@ func TestManageRoleReplicas(t *testing.T) {
 			expectRequeue:    true,
 		},
 		{
-			// Regression test: a pod with no OwnerReferences must not panic
-			// when manageRoleReplicasPerGroup logs the mismatch (previously
-			// indexed pod.OwnerReferences[0] unconditionally).
-			name:              "reenqueue when pod has no owner references",
+			// Regression test: a pod with no OwnerReferences must not panic when
+			// manageRoleReplicasPerGroup logs it (previously indexed
+			// pod.OwnerReferences[0] unconditionally). Unlike an owner-UID
+			// mismatch, nothing here can resolve an ownerless pod, so it must not
+			// requeue either -- see the "len(pod.OwnerReferences) == 0" branch.
+			name:              "does not panic and does not requeue when pod has no owner references",
 			roleReplicas:      1,
 			workerReplicas:    0,
 			initialRoleIDs:    []int{0},
@@ -2811,7 +2811,7 @@ func TestManageRoleReplicas(t *testing.T) {
 			noOwnerReferences: true,
 			expectedRoleSize:  1,
 			expectedPodCount:  1,
-			expectRequeue:     true,
+			expectRequeue:     false,
 		},
 	}
 
@@ -3036,47 +3036,10 @@ func TestHasUpdateableOutdatedRole(t *testing.T) {
 	}
 }
 
-// TestWorkerRecoversFromPanic verifies that a panic raised while processing one
-// work item does not terminate the worker goroutine or the controller process.
-// processNextWorkItem calls syncHandler through safeSync, which recovers any
-// panic and turns it into a regular sync error (handled via the existing
-// rate-limited requeue path). This test drives c.worker the same way Run does,
-// so a regression here would either crash the test binary or leave the
-// "safe-key" item unprocessed.
-func TestWorkerRecoversFromPanic(t *testing.T) {
-	kubeClient := kubefake.NewSimpleClientset()
-	kthenaClient := kthenafake.NewSimpleClientset()
-	volcanoClient := volcanofake.NewSimpleClientset()
-	apiextClient := apiextfake.NewSimpleClientset(testhelper.CreatePodGroupCRD())
-
-	controller, err := NewModelServingController(kubeClient, kthenaClient, volcanoClient, apiextClient)
-	assert.NoError(t, err)
-
-	var safeKeyProcessed atomic.Bool
-	controller.syncHandler = func(_ context.Context, key string) error {
-		if key == "default/panic-key" {
-			panic("simulated unexpected panic during pod processing")
-		}
-		if key == "default/safe-key" {
-			safeKeyProcessed.Store(true)
-		}
-		return nil
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go wait.UntilWithContext(ctx, controller.worker, time.Millisecond)
-
-	controller.workqueue.Add("default/panic-key")
-	controller.workqueue.Add("default/safe-key")
-
-	processed := waitForObjectInCache(t, 2*time.Second, safeKeyProcessed.Load)
-	assert.True(t, processed, "worker should keep processing items after recovering from a panic")
-}
-
-// TestWorkerSurvivesOwnerlessPodThroughRealReconcile reproduces the reported panic through
-// the actual production path rather than calling manageRoleReplicasPerGroup directly.
+// TestSyncHandlerSurvivesOwnerlessPodThroughRealReconcile reproduces the reported panic
+// through the actual production reconcile chain (syncHandler -> syncModelServing ->
+// syncRoleReplicas -> manageRoleReplicasPerGroup) rather than calling
+// manageRoleReplicasPerGroup directly.
 //
 // The pods informer only filters on the presence of the GroupNameLabelKey label
 // (see NewModelServingController); it has no relationship to OwnerReferences.
@@ -3088,13 +3051,16 @@ func TestWorkerRecoversFromPanic(t *testing.T) {
 //
 // This test creates such a pod directly through the fake clientset that the
 // controller's real informer watches, waits for it to land in the actual
-// RoleIDKey index, and then drives the real worker entrypoint
-// (processNextWorkItem, exactly what the worker goroutine calls) to reconcile
-// the owning ModelServing -- reproducing pod event/informer -> worker ->
-// processNextWorkItem -> syncHandler -> syncModelServing -> syncRoleReplicas ->
-// manageRoleReplicasPerGroup end to end, and confirming the controller keeps
-// reconciling afterward.
-func TestWorkerSurvivesOwnerlessPodThroughRealReconcile(t *testing.T) {
+// RoleIDKey index, and then calls controller.syncHandler directly -- the same
+// function field processNextWorkItem invokes -- instead of going through
+// processNextWorkItem. That is deliberate: any panic-recovery wrapper at the
+// processNextWorkItem level (present or future) would convert a panic from a
+// missing owner-reference guard into a swallowed error, and a test that only
+// asserts processNextWorkItem itself doesn't panic would keep passing whether or
+// not the guard is actually in place. Calling syncHandler directly and asserting
+// both that it does not panic and that it returns no error pins the guard itself:
+// removing it makes this test fail regardless of any recovery wrapper elsewhere.
+func TestSyncHandlerSurvivesOwnerlessPodThroughRealReconcile(t *testing.T) {
 	roleName := "default"
 	ms := &workloadv1alpha1.ModelServing{
 		ObjectMeta: metav1.ObjectMeta{
@@ -3156,17 +3122,18 @@ func TestWorkerSurvivesOwnerlessPodThroughRealReconcile(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond, "owner-less pod never reached the real pods informer index")
 
 	key := namespacedKey(ms.Namespace, ms.Name)
-	controller.workqueue.Add(key)
+	var syncErr error
 	require.NotPanics(t, func() {
-		controller.processNextWorkItem(context.Background())
-	}, "reconciling a ModelServing with an owner-less same-labeled pod must not panic the worker")
+		syncErr = controller.syncHandler(context.Background(), key)
+	}, "reconciling a ModelServing with an owner-less same-labeled pod must not panic")
+	require.NoError(t, syncErr, "reconciliation must succeed despite the owner-less pod")
 
-	// The controller must still be able to reconcile afterward, proving the
-	// worker goroutine (and process) survived the owner-less pod.
-	controller.workqueue.Add(key)
+	// Reconciling again must still succeed: the owner-less pod is skipped
+	// (continue), not left in a state that breaks subsequent reconciliation.
 	require.NotPanics(t, func() {
-		controller.processNextWorkItem(context.Background())
-	}, "worker should keep reconciling after encountering an owner-less pod")
+		syncErr = controller.syncHandler(context.Background(), key)
+	}, "reconciliation must keep working after encountering an owner-less pod")
+	require.NoError(t, syncErr)
 }
 
 // TestScaleDownServingGroups tests the scaleDownServingGroups function with various scenarios

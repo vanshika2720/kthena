@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
-	"runtime/debug"
 	"slices"
 	"sync"
 	"time"
@@ -532,7 +531,7 @@ func (c *ModelServingController) processNextWorkItem(ctx context.Context) bool {
 	}
 	defer c.workqueue.Done(key)
 
-	err := c.safeSync(ctx, key.(string))
+	err := c.syncHandler(ctx, key.(string))
 	if err == nil {
 		c.workqueue.Forget(key)
 		return true
@@ -542,19 +541,6 @@ func (c *ModelServingController) processNextWorkItem(ctx context.Context) bool {
 	c.workqueue.AddRateLimited(key)
 
 	return true
-}
-
-// safeSync invokes syncHandler and recovers from any panic raised while processing
-// a single item, so that one malformed/unexpected object cannot crash the worker
-// goroutine (and with it the whole ModelServing controller process). The panic is
-// converted into an error, which is handled the same way as any other sync failure.
-func (c *ModelServingController) safeSync(ctx context.Context, key string) (err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("panic while syncing %q: %v\n%s", key, r, debug.Stack())
-		}
-	}()
-	return c.syncHandler(ctx, key)
 }
 
 func (c *ModelServingController) syncModelServing(ctx context.Context, key string) error {
@@ -1160,14 +1146,17 @@ func (c *ModelServingController) manageRoleReplicasPerGroup(ctx context.Context,
 			continue
 		}
 		for _, pod := range pods {
+			if len(pod.OwnerReferences) == 0 {
+				// continue (not break): an ownerless pod doesn't affect its siblings, so keep
+				// checking them. No re-enqueue: nothing here can resolve an ownerless pod.
+				klog.Warningf("manageRoleReplicasPerGroup: pod %s/%s has no owner references, expected ModelServing %s/%s (UID=%s)",
+					pod.Namespace, pod.Name, ms.Namespace, ms.Name, ms.UID)
+				continue
+			}
 			if !utils.IsOwnedByModelServingWithUID(pod, ms.UID) {
 				// If the pod is not owned by the ModelServing, we do not need to handle it.
-				gotUID := types.UID("<none>")
-				if len(pod.OwnerReferences) > 0 {
-					gotUID = pod.OwnerReferences[0].UID
-				}
 				klog.Warningf("manageRoleReplicasPerGroup: pod %s/%s may be left from previous same-named ModelServing %s/%s (expected UID=%s, got UID=%s), re-enqueuing",
-					pod.Namespace, pod.Name, ms.Namespace, ms.Name, ms.UID, gotUID)
+					pod.Namespace, pod.Name, ms.Namespace, ms.Name, ms.UID, pod.OwnerReferences[0].UID)
 				c.enqueueModelServingAfter(ms, 1*time.Second)
 				break
 			}
