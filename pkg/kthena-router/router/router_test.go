@@ -3750,3 +3750,99 @@ func TestRouter_ProxyToPDDisaggregated_RetryBehavior(t *testing.T) {
 		})
 	}
 }
+
+// TestRouter_ProxyToPDDisaggregated_ResponsesUpstreamError covers the review concern that a
+// non-2xx Responses upstream response, if written to c.Writer immediately, would make
+// c.Writer.Written() true and stop the retry loop above from trying another prefill/decode
+// pair on the very first failed attempt. connectors.ResponsesUpstreamError lets decoderProxy
+// report such a response without writing it, so this verifies the retry loop actually uses
+// that: it keeps retrying while the error is only a captured-but-unwritten
+// ResponsesUpstreamError, and forwards the real upstream response once retries are exhausted.
+func TestRouter_ProxyToPDDisaggregated_ResponsesUpstreamError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	pod1 := &corev1.Pod{
+		ObjectMeta: v1.ObjectMeta{Name: "pod-1", Namespace: "default"},
+		Status:     corev1.PodStatus{PodIP: "10.0.0.1"},
+	}
+	pod2 := &corev1.Pod{
+		ObjectMeta: v1.ObjectMeta{Name: "pod-2", Namespace: "default"},
+		Status:     corev1.PodStatus{PodIP: "10.0.0.2"},
+	}
+	info1 := &datastore.PodInfo{Pod: pod1}
+	info2 := &datastore.PodInfo{Pod: pod2}
+
+	t.Run("retries the second pod pair instead of stopping on the first non-2xx", func(t *testing.T) {
+		store := datastore.New()
+		router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+		ctx := &framework.Context{
+			Model:       "responses-model",
+			PrefillPods: []*datastore.PodInfo{info1, info2},
+			DecodePods:  []*datastore.PodInfo{info1, info2},
+		}
+
+		mockConnector := &mockKVConnector{}
+		mockConnector.proxyHandler = func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error) {
+			if mockConnector.calls.Load() == 1 {
+				// First pod pair: a genuine non-2xx Responses response, captured but not
+				// written yet. c.Writer.Written() must stay false so the loop retries.
+				return 0, &connectors.ResponsesUpstreamError{
+					StatusCode: http.StatusServiceUnavailable,
+					Header:     http.Header{},
+					Body:       []byte(`{"error":"pod 1 overloaded"}`),
+				}
+			}
+			// Second pod pair succeeds.
+			c.Writer.WriteHeader(http.StatusOK)
+			_, _ = c.Writer.Write([]byte(`{"id":"resp_1"}`))
+			return 7, nil
+		}
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request, _ = http.NewRequest("POST", "/v1/responses", bytes.NewBufferString(`{"model":"responses-model"}`))
+
+		err := router.proxyToPDDisaggregated(c, c.Request, ctx, mockConnector, ModelRequest{"model": "responses-model"}, 8000, 2*time.Second)
+
+		assert.NoError(t, err)
+		assert.Equal(t, int32(2), mockConnector.calls.Load(),
+			"must retry the second pod pair after the first returns a captured, unwritten Responses error")
+		assert.Equal(t, http.StatusOK, w.Code)
+		assert.Equal(t, `{"id":"resp_1"}`, w.Body.String())
+	})
+
+	t.Run("forwards the last attempt's real status, body, and headers once retries are exhausted", func(t *testing.T) {
+		store := datastore.New()
+		router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+		ctx := &framework.Context{
+			Model:       "responses-model",
+			PrefillPods: []*datastore.PodInfo{info1, info2},
+			DecodePods:  []*datastore.PodInfo{info1, info2},
+		}
+
+		mockConnector := &mockKVConnector{}
+		mockConnector.proxyHandler = func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error) {
+			// Every attempt fails with a genuine (not connection-level) upstream error.
+			n := mockConnector.calls.Load()
+			return 0, &connectors.ResponsesUpstreamError{
+				StatusCode: http.StatusServiceUnavailable,
+				Header:     http.Header{"X-Upstream-Pod": []string{fmt.Sprintf("pod-%d", n)}},
+				Body:       []byte(fmt.Sprintf(`{"error":"pod %d overloaded"}`, n)),
+			}
+		}
+
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request, _ = http.NewRequest("POST", "/v1/responses", bytes.NewBufferString(`{"model":"responses-model"}`))
+
+		err := router.proxyToPDDisaggregated(c, c.Request, ctx, mockConnector, ModelRequest{"model": "responses-model"}, 8000, 2*time.Second)
+
+		var respErr *connectors.ResponsesUpstreamError
+		assert.ErrorAs(t, err, &respErr)
+		assert.Equal(t, int32(2), mockConnector.calls.Load())
+		// The client must see the LAST attempt's real upstream response, not a generic 500.
+		assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+		assert.Equal(t, `{"error":"pod 2 overloaded"}`, w.Body.String())
+		assert.Equal(t, "pod-2", w.Header().Get("X-Upstream-Pod"))
+	})
+}

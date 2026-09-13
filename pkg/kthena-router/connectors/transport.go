@@ -83,6 +83,29 @@ func prefillerProxy(_ *gin.Context, req *http.Request, timeout time.Duration) er
 	return nil
 }
 
+// ResponsesUpstreamError carries a non-2xx OpenAI Responses API upstream response without
+// writing it to the client. decoderProxy returns this instead of writing directly, so the PD
+// retry loop in proxyToPDDisaggregated can still try another prefill/decode pair: writing to
+// c.Writer immediately would make c.Writer.Written() true and stop the retry loop on the very
+// first failed attempt. The caller decides when to call WriteTo — only once retries are
+// exhausted (or not retryable) and this is the response that will actually reach the client.
+type ResponsesUpstreamError struct {
+	StatusCode int
+	Header     http.Header
+	Body       []byte
+}
+
+func (e *ResponsesUpstreamError) Error() string {
+	return fmt.Sprintf("decode request failed with status %d", e.StatusCode)
+}
+
+// WriteTo forwards the captured upstream status, headers, and body to the client.
+func (e *ResponsesUpstreamError) WriteTo(c *gin.Context) {
+	copyResponseHeaders(c, e.Header)
+	c.Status(e.StatusCode)
+	_, _ = c.Writer.Write(e.Body)
+}
+
 func decoderProxy(c *gin.Context, req *http.Request, timeout time.Duration) (int, error) {
 	resp, err := roundTrip(req, timeout)
 	if err != nil {
@@ -93,13 +116,17 @@ func decoderProxy(c *gin.Context, req *http.Request, timeout time.Duration) (int
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		if isResponsesPath(originalRequestPath(c, req)) {
 			// Chat Completions falls through without forwarding anything here
-			// (unchanged, pre-existing behavior); for Responses, forward the
-			// upstream status and body so the client sees the real error instead
-			// of losing it, matching how the aggregated (non-PD) Responses path
-			// already forwards non-2xx responses via forwardResponseWithUsageParser.
-			copyResponseHeaders(c, resp.Header)
-			c.Status(resp.StatusCode)
-			_, _ = io.Copy(c.Writer, resp.Body)
+			// (unchanged, pre-existing behavior). For Responses, capture the
+			// upstream status/headers/body instead of writing them now: the PD
+			// retry loop (proxyToPDDisaggregated) still needs the chance to try
+			// another prefill/decode pair, which it can only do while c.Writer
+			// stays unwritten. The caller forwards this via WriteTo once it
+			// decides no further retry will happen.
+			body, readErr := io.ReadAll(resp.Body)
+			if readErr != nil {
+				return 0, fmt.Errorf("failed to read decode error response with status %d: %w", resp.StatusCode, readErr)
+			}
+			return 0, &ResponsesUpstreamError{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: body}
 		}
 		return 0, fmt.Errorf("decode request failed with status %d", resp.StatusCode)
 	}

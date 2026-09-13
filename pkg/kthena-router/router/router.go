@@ -1430,6 +1430,10 @@ func (r *Router) proxyToPDDisaggregated(
 		maxRetry = len(ctx.PrefillPods)
 	}
 
+	// Set when an attempt fails with a captured (not yet written) Responses upstream
+	// error, so it can still be forwarded to the client below if every retry fails.
+	var lastResponsesErr *connectors.ResponsesUpstreamError
+
 	for i := 0; i < maxRetry; i++ {
 		if ctx.PrefillPods[i] == nil || ctx.DecodePods[i] == nil {
 			continue
@@ -1466,6 +1470,10 @@ func (r *Router) proxyToPDDisaggregated(
 				prefillPod.Name, decodePod.Name, err)
 			if c.Writer.Written() {
 				return err
+			}
+			var responsesErr *connectors.ResponsesUpstreamError
+			if errors.As(err, &responsesErr) {
+				lastResponsesErr = responsesErr
 			}
 			continue
 		}
@@ -1509,6 +1517,16 @@ func (r *Router) proxyToPDDisaggregated(
 	}
 
 	if !c.Writer.Written() {
+		// Every retry failed. If at least one attempt got a real (non-2xx) Responses
+		// upstream response rather than a connection-level failure, forward that
+		// response's actual status/headers/body instead of a generic 500 — this is
+		// the last one observed, matching the existing "last attempt wins" behavior
+		// implicit in this loop (accesslog.SetUpstreamInfo etc. also reflect only
+		// the final attempt).
+		if lastResponsesErr != nil {
+			lastResponsesErr.WriteTo(c)
+			return lastResponsesErr
+		}
 		c.AbortWithStatusJSON(http.StatusInternalServerError, "all prefill/decode attempts failed")
 	}
 	return fmt.Errorf("all prefill/decode attempts failed")

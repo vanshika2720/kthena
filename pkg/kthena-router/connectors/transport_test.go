@@ -1004,15 +1004,19 @@ func TestDecoderProxyResponsesAPIStreaming(t *testing.T) {
 	}
 }
 
-// TestDecoderProxyResponsesAPINonStreamingErrorForwardsBody covers the review concern that
-// decoderProxy returned on any non-2xx status before reaching the Responses-specific
-// forwarding path, silently dropping the upstream status and error body for the client.
-func TestDecoderProxyResponsesAPINonStreamingErrorForwardsBody(t *testing.T) {
+// TestDecoderProxyResponsesAPINonStreamingErrorDoesNotWritePrematurely covers the review
+// concern that decoderProxy wrote a non-2xx Responses response to c.Writer immediately,
+// which made c.Writer.Written() true and stopped proxyToPDDisaggregated's retry loop from
+// trying another prefill/decode pair on the very first failed attempt. decoderProxy must
+// instead return the upstream status/headers/body via ResponsesUpstreamError without writing
+// anything, leaving the retry decision (and the eventual write) to the caller.
+func TestDecoderProxyResponsesAPINonStreamingErrorDoesNotWritePrematurely(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	errBody := `{"error":{"message":"invalid input","type":"invalid_request_error"}}`
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Upstream", "yes")
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = w.Write([]byte(errBody))
 	}))
@@ -1027,11 +1031,27 @@ func TestDecoderProxyResponsesAPINonStreamingErrorForwardsBody(t *testing.T) {
 
 	outputTokens, err := decoderProxy(c, testReq, 0)
 
-	assert.Error(t, err, "the failed decode is still reported as an error to the PD retry loop")
-	assert.Contains(t, err.Error(), "decode request failed with status 400")
+	// The error is returned, not written: the PD retry loop must still be able to try
+	// another prefill/decode pair (c.Writer.Written() must stay false here).
+	require.Error(t, err)
 	assert.Equal(t, 0, outputTokens)
-	assert.Equal(t, http.StatusBadRequest, w.Code, "the real upstream status must reach the client")
-	assert.Equal(t, errBody, w.Body.String(), "the real upstream error body must reach the client")
+	assert.False(t, c.Writer.Written(), "decoderProxy must not write to the client before the retry loop decides")
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Empty(t, w.Body.String())
+
+	var respErr *ResponsesUpstreamError
+	require.ErrorAs(t, err, &respErr, "a Responses non-2xx must be returned as *ResponsesUpstreamError so the caller can retry")
+	assert.Equal(t, http.StatusBadRequest, respErr.StatusCode)
+	assert.Equal(t, errBody, string(respErr.Body))
+	assert.Equal(t, "yes", respErr.Header.Get("X-Upstream"))
+
+	// Once the caller (proxyToPDDisaggregated) decides no further retry will happen, it
+	// forwards the captured response via WriteTo — verify that produces the real upstream
+	// status/headers/body, not a generic error.
+	respErr.WriteTo(c)
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.Equal(t, errBody, w.Body.String())
+	assert.Equal(t, "yes", w.Header().Get("X-Upstream"))
 }
 
 // TestDecoderProxyResponsesAPIUsesOriginalPathAfterURLRewrite covers the review concern
