@@ -254,10 +254,9 @@ func unmutatedResponsesBody(c *gin.Context, modelRequest map[string]interface{})
 // AddTokenUsage adds token usage to the request body if it is not already present
 // should be used for decode requests or non PD disaggregated mode
 func AddTokenUsage(c *gin.Context, reqBody map[string]interface{}) map[string]interface{} {
-	// The OpenAI Responses API returns usage natively (in the response body and
-	// the response.completed/incomplete/failed terminal events), and
-	// include_usage / stream_options are not valid Responses request fields.
-	// Never inject them; Chat Completions paths are unaffected.
+	// Responses requests already get usage natively; include_usage/stream_options
+	// are Chat Completions-only fields and must not be injected here. This guard
+	// covers the nixl/sglang PD decode paths, which call AddTokenUsage directly.
 	if c != nil && c.Request != nil && isResponsesPath(c.Request.URL.Path) {
 		return reqBody
 	}
@@ -374,9 +373,8 @@ func handleNonStreamingResponse(c *gin.Context, resp *http.Response) (int, error
 }
 
 // handleResponsesStreamingResponse forwards an OpenAI Responses SSE stream
-// verbatim and returns the output-token count reported by the terminal event.
-// It does not rely on a `data: [DONE]` marker; parser.FinalStreamUsage reports
-// usage once a response.completed/incomplete/failed event has been seen.
+// verbatim, tracking usage via parser as each line is written; see
+// providers.ResponseUsageParser for how the terminal event is detected.
 func handleResponsesStreamingResponse(c *gin.Context, resp *http.Response, parser providers.ResponseUsageParser) (int, error) {
 	reader := bufio.NewReader(resp.Body)
 	var streamErr error
@@ -409,8 +407,7 @@ func handleResponsesStreamingResponse(c *gin.Context, resp *http.Response, parse
 }
 
 // handleResponsesNonStreamingResponse forwards a non-streaming OpenAI Responses
-// body verbatim and extracts input_tokens/output_tokens/total_tokens via the
-// shared provider parser.
+// body verbatim, extracting usage via parser.ParseBody.
 func handleResponsesNonStreamingResponse(c *gin.Context, resp *http.Response, parser providers.ResponseUsageParser) (int, error) {
 	var buf bytes.Buffer
 	teeReader := io.TeeReader(resp.Body, &buf)
