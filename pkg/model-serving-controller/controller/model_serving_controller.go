@@ -1146,13 +1146,8 @@ func (c *ModelServingController) manageRoleReplicasPerGroup(ctx context.Context,
 		}
 		for _, pod := range pods {
 			if len(pod.OwnerReferences) == 0 {
-				// An ownerless pod can never belong to this (or any) ModelServing, but unlike a
-				// pod with a mismatched owner UID, a missing owner reference is not evidence that
-				// its sibling pods for this role are affected the same way (entry/worker pods for
-				// the same role instance are always created with identical owner references), so
-				// keep inspecting the remaining pods instead of stopping early. Nothing in this
-				// reconciliation path deletes or adopts an ownerless pod, so re-enqueuing here
-				// would just requeue forever without ever making progress.
+				// continue (not break): an ownerless pod doesn't affect its siblings, so keep
+				// checking them. No re-enqueue: nothing here can resolve an ownerless pod.
 				klog.Warningf("manageRoleReplicasPerGroup: pod %s/%s has no owner references, expected ModelServing %s/%s (UID=%s)",
 					pod.Namespace, pod.Name, ms.Namespace, ms.Name, ms.UID)
 				continue
