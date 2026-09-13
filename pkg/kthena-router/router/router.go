@@ -1140,8 +1140,23 @@ func proxyRequest(
 	if err != nil {
 		return fmt.Errorf("decode request error: %w", err)
 	}
-	parser := providers.DefaultAdapter().ResponseParser(c, req.URL.Path)
+	parser := providers.DefaultAdapter().ResponseParser(c, originalRequestPath(c, req))
 	return forwardResponseWithUsageParser(c, resp, stream, parser, onUsage)
+}
+
+// originalRequestPath returns the client-facing request path used for wire
+// protocol detection (e.g. selecting the OpenAI Responses vs Chat Completions
+// response parser). It prefers the path recorded by the access-log middleware,
+// which always runs before HTTPRoute matching and so captures the path before
+// any URLRewrite filter can mutate req.URL.Path in place; it falls back to
+// req.URL.Path when no access-log context is set.
+func originalRequestPath(c *gin.Context, req *http.Request) string {
+	if c != nil {
+		if accessCtx := accesslog.GetAccessLogContext(c); accessCtx != nil && accessCtx.Path != "" {
+			return accessCtx.Path
+		}
+	}
+	return req.URL.Path
 }
 
 func proxyExternalRequest(
@@ -1460,9 +1475,28 @@ func (r *Router) proxyToPDDisaggregated(
 			r.loadRateLimiter.RecordOutputTokens(ctx.Model, outputTokens)
 		}
 
+		// Update access log with output tokens, same as the aggregated (non-PD) path.
+		accessCtx := accesslog.GetAccessLogContext(c)
+		if accessCtx != nil {
+			accessCtx.SetTokenCounts(accessCtx.InputTokens, outputTokens)
+		}
+
 		// Record output token metrics
 		if metricsRecorder != nil {
 			metricsRecorder.RecordOutputTokens(outputTokens)
+		}
+
+		// Update per-user/model token count for fairness scheduling. kvConnector.Proxy
+		// only returns the decoded output-token count, not the upstream-reported
+		// prompt-token count the aggregated path uses here, so this reuses the
+		// pre-request tokenizer estimate already held in accessCtx.InputTokens (the
+		// same value the access-log update above uses).
+		if userID := c.GetString(common.UserIdKey); userID != "" && ctx.Model != "" {
+			inputTokens := 0
+			if accessCtx != nil {
+				inputTokens = accessCtx.InputTokens
+			}
+			_ = r.store.UpdateTokenCount(userID, ctx.Model, float64(inputTokens), float64(outputTokens))
 		}
 
 		// Record successful operation in cache

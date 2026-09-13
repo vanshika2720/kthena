@@ -29,6 +29,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/accesslog"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/common"
 )
 
@@ -269,7 +270,7 @@ func TestBuildPrefillRequest(t *testing.T) {
 			// Create a test HTTP request
 			originalReq := httptest.NewRequest("POST", "/test", nil)
 
-			result := buildPrefillRequest(originalReq, tt.modelRequest)
+			result := buildPrefillRequest(nil, originalReq, tt.modelRequest)
 
 			if tt.expectNil {
 				assert.Nil(t, result)
@@ -362,7 +363,7 @@ func TestBuildPrefillRequestResponsesAPI(t *testing.T) {
 		"previous_response_id": "resp_1",
 	}
 
-	result := buildPrefillRequest(req, modelRequest)
+	result := buildPrefillRequest(nil, req, modelRequest)
 	require.NotNil(t, result)
 
 	body, err := io.ReadAll(result.Body)
@@ -913,6 +914,10 @@ func TestDecoderProxy(t *testing.T) {
 				if tt.errorContains != "" {
 					assert.Contains(t, err.Error(), tt.errorContains)
 				}
+				// Unchanged pre-existing behavior for non-Responses paths: nothing
+				// is forwarded to the client on a non-2xx decode response.
+				assert.Equal(t, http.StatusOK, w.Code)
+				assert.Empty(t, w.Body.String())
 			} else {
 				assert.NoError(t, err)
 			}
@@ -997,6 +1002,70 @@ func TestDecoderProxyResponsesAPIStreaming(t *testing.T) {
 			assert.NotContains(t, w.Body.String(), "[DONE]")
 		})
 	}
+}
+
+// TestDecoderProxyResponsesAPINonStreamingErrorForwardsBody covers the review concern that
+// decoderProxy returned on any non-2xx status before reaching the Responses-specific
+// forwarding path, silently dropping the upstream status and error body for the client.
+func TestDecoderProxyResponsesAPINonStreamingErrorForwardsBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	errBody := `{"error":{"message":"invalid input","type":"invalid_request_error"}}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(errBody))
+	}))
+	defer server.Close()
+
+	w := CreateTestResponseRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("POST", "/v1/responses", nil)
+
+	testReq, err := http.NewRequest("POST", server.URL+"/v1/responses", bytes.NewBufferString(`{"model":"m","input":"hi"}`))
+	require.NoError(t, err)
+
+	outputTokens, err := decoderProxy(c, testReq, 0)
+
+	assert.Error(t, err, "the failed decode is still reported as an error to the PD retry loop")
+	assert.Contains(t, err.Error(), "decode request failed with status 400")
+	assert.Equal(t, 0, outputTokens)
+	assert.Equal(t, http.StatusBadRequest, w.Code, "the real upstream status must reach the client")
+	assert.Equal(t, errBody, w.Body.String(), "the real upstream error body must reach the client")
+}
+
+// TestDecoderProxyResponsesAPIUsesOriginalPathAfterURLRewrite covers the review concern
+// that isResponsesPath could be fooled by an HTTPRoute URLRewrite: by the time a request
+// reaches decoderProxy, req.URL.Path may already be the rewritten backend path rather than
+// the client's original "/v1/responses". AccessLogMiddleware runs before any URLRewrite is
+// applied, so its recorded path is used here instead.
+func TestDecoderProxyResponsesAPIUsesOriginalPathAfterURLRewrite(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	respBody := `{"id":"resp_1","usage":{"input_tokens":11,"output_tokens":7,"total_tokens":18}}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(respBody))
+	}))
+	defer server.Close()
+
+	w := CreateTestResponseRecorder()
+	c, _ := gin.CreateTestContext(w)
+	// req.URL.Path no longer looks like "/v1/responses" here, as if an
+	// HTTPRoute URLRewrite already rewrote it to a backend-specific path.
+	c.Request = httptest.NewRequest("POST", "/rewritten/backend-path", nil)
+	accessCtx := accesslog.NewAccessLogContext("req-1", http.MethodPost, "/v1/responses", "HTTP/1.1", "")
+	c.Set(accesslog.AccessLogContextKey, accessCtx)
+
+	testReq, err := http.NewRequest("POST", server.URL+"/rewritten/backend-path", bytes.NewBufferString(`{"model":"m","input":"hi"}`))
+	require.NoError(t, err)
+
+	outputTokens, err := decoderProxy(c, testReq, 0)
+	require.NoError(t, err)
+
+	assert.Equal(t, 7, outputTokens, "Responses usage parsing must apply based on the original "+
+		"client path even though req.URL.Path was rewritten away from /v1/responses")
+	assert.Equal(t, respBody, w.Body.String())
 }
 
 func TestDecoderProxyChatCompletionsUnchanged(t *testing.T) {

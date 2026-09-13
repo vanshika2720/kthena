@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/volcano-sh/kthena/pkg/kthena-router/accesslog"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/common"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/handlers"
 	"github.com/volcano-sh/kthena/pkg/kthena-router/providers"
@@ -90,16 +91,20 @@ func decoderProxy(c *gin.Context, req *http.Request, timeout time.Duration) (int
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if isResponsesPath(originalRequestPath(c, req)) {
+			// Chat Completions falls through without forwarding anything here
+			// (unchanged, pre-existing behavior); for Responses, forward the
+			// upstream status and body so the client sees the real error instead
+			// of losing it, matching how the aggregated (non-PD) Responses path
+			// already forwards non-2xx responses via forwardResponseWithUsageParser.
+			copyResponseHeaders(c, resp.Header)
+			c.Status(resp.StatusCode)
+			_, _ = io.Copy(c.Writer, resp.Body)
+		}
 		return 0, fmt.Errorf("decode request failed with status %d", resp.StatusCode)
 	}
 
-	// Copy response headers
-	for k, vv := range resp.Header {
-		for _, v := range vv {
-			c.Header(k, v)
-		}
-	}
-
+	copyResponseHeaders(c, resp.Header)
 	c.Status(resp.StatusCode)
 
 	// Determine if this is a streaming response
@@ -109,8 +114,8 @@ func decoderProxy(c *gin.Context, req *http.Request, timeout time.Duration) (int
 	// (input_tokens/output_tokens) and streaming terminal events
 	// (response.completed/incomplete/failed, no `data: [DONE]`). Route it through
 	// the shared provider response parser instead of the Chat Completions helpers.
-	if isResponsesPath(req.URL.Path) {
-		parser := providers.DefaultAdapter().ResponseParser(c, req.URL.Path)
+	if isResponsesPath(originalRequestPath(c, req)) {
+		parser := providers.DefaultAdapter().ResponseParser(c, originalRequestPath(c, req))
 		if stream {
 			outputTokens, err := handleResponsesStreamingResponse(c, resp, parser)
 			if err != nil {
@@ -162,9 +167,9 @@ func preparePrefillBody(reqBody map[string]interface{}, path string) {
 	}
 }
 
-func buildPrefillRequest(req *http.Request, modelRequest map[string]interface{}) *http.Request {
+func buildPrefillRequest(c *gin.Context, req *http.Request, modelRequest map[string]interface{}) *http.Request {
 	// In PD disaggregated mode, we need to send a prefill request to the prefill pod with non stream mode.
-	preparePrefillBody(modelRequest, req.URL.Path)
+	preparePrefillBody(modelRequest, originalRequestPath(c, req))
 
 	body, err := json.Marshal(modelRequest)
 	if err != nil {
@@ -182,7 +187,7 @@ func buildPrefillRequest(req *http.Request, modelRequest map[string]interface{})
 
 func BuildDecodeRequest(c *gin.Context, req *http.Request, modelRequest map[string]interface{}) *http.Request {
 	var body []byte
-	if isResponsesPath(req.URL.Path) {
+	if isResponsesPath(originalRequestPath(c, req)) {
 		// OpenAI Responses API: stream_options.include_usage / include_usage are
 		// Chat Completions fields and must never be injected. When the parsed
 		// request still matches the original body (no model rewrite) replay that
@@ -218,6 +223,30 @@ func BuildDecodeRequest(c *gin.Context, req *http.Request, modelRequest map[stri
 // It mirrors the exact-match convention used by the provider adapters.
 func isResponsesPath(p string) bool {
 	return p == "/v1/responses"
+}
+
+// originalRequestPath returns the client-facing request path used for wire
+// protocol detection (e.g. isResponsesPath). It prefers the path recorded by
+// the access-log middleware, which always runs before HTTPRoute matching and
+// so captures the path before any URLRewrite filter can mutate req.URL.Path
+// in place; it falls back to req.URL.Path when no access-log context is set
+// (e.g. connector unit tests that call these helpers directly).
+func originalRequestPath(c *gin.Context, req *http.Request) string {
+	if c != nil {
+		if accessCtx := accesslog.GetAccessLogContext(c); accessCtx != nil && accessCtx.Path != "" {
+			return accessCtx.Path
+		}
+	}
+	return req.URL.Path
+}
+
+// copyResponseHeaders copies all upstream response headers onto the client response.
+func copyResponseHeaders(c *gin.Context, headers http.Header) {
+	for k, vv := range headers {
+		for _, v := range vv {
+			c.Header(k, v)
+		}
+	}
 }
 
 // unmutatedResponsesBody returns the original raw request body when it is
@@ -257,7 +286,7 @@ func AddTokenUsage(c *gin.Context, reqBody map[string]interface{}) map[string]in
 	// Responses requests already get usage natively; include_usage/stream_options
 	// are Chat Completions-only fields and must not be injected here. This guard
 	// covers the nixl/sglang PD decode paths, which call AddTokenUsage directly.
-	if c != nil && c.Request != nil && isResponsesPath(c.Request.URL.Path) {
+	if c != nil && c.Request != nil && isResponsesPath(originalRequestPath(c, c.Request)) {
 		return reqBody
 	}
 	// Check if streaming is enabled
