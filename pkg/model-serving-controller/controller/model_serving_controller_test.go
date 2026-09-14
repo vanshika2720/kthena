@@ -2798,11 +2798,7 @@ func TestManageRoleReplicas(t *testing.T) {
 			expectRequeue:    true,
 		},
 		{
-			// Regression test: a pod with no OwnerReferences must not panic when
-			// manageRoleReplicasPerGroup logs it (previously indexed
-			// pod.OwnerReferences[0] unconditionally). Unlike an owner-UID
-			// mismatch, nothing here can resolve an ownerless pod, so it must not
-			// requeue either -- see the "len(pod.OwnerReferences) == 0" branch.
+			// Regression test: a pod with no OwnerReferences must not panic.
 			name:              "does not panic and does not requeue when pod has no owner references",
 			roleReplicas:      1,
 			workerReplicas:    0,
@@ -3037,29 +3033,8 @@ func TestHasUpdateableOutdatedRole(t *testing.T) {
 }
 
 // TestSyncHandlerSurvivesOwnerlessPodThroughRealReconcile reproduces the reported panic
-// through the actual production reconcile chain (syncHandler -> syncModelServing ->
-// syncRoleReplicas -> manageRoleReplicasPerGroup) rather than calling
-// manageRoleReplicasPerGroup directly.
-//
-// The pods informer only filters on the presence of the GroupNameLabelKey label
-// (see NewModelServingController); it has no relationship to OwnerReferences.
-// RoleIDIndexFunc, which manageRoleReplicasPerGroup queries via getPodsByIndex,
-// also indexes purely on labels. Nothing in the informer/index layer requires a
-// pod to be owned by the ModelServing it is labeled for, so any pod created (by a
-// person, another controller, or a stale leftover) with the right role labels but
-// no OwnerReferences reaches the same reconcile path as a legitimate pod.
-//
-// This test creates such a pod directly through the fake clientset that the
-// controller's real informer watches, waits for it to land in the actual
-// RoleIDKey index, and then calls controller.syncHandler directly -- the same
-// function field processNextWorkItem invokes -- instead of going through
-// processNextWorkItem. That is deliberate: any panic-recovery wrapper at the
-// processNextWorkItem level (present or future) would convert a panic from a
-// missing owner-reference guard into a swallowed error, and a test that only
-// asserts processNextWorkItem itself doesn't panic would keep passing whether or
-// not the guard is actually in place. Calling syncHandler directly and asserting
-// both that it does not panic and that it returns no error pins the guard itself:
-// removing it makes this test fail regardless of any recovery wrapper elsewhere.
+// through the real reconcile chain (syncHandler -> ... -> manageRoleReplicasPerGroup)
+// and verifies reconciliation keeps working afterward.
 func TestSyncHandlerSurvivesOwnerlessPodThroughRealReconcile(t *testing.T) {
 	roleName := "default"
 	ms := &workloadv1alpha1.ModelServing{
@@ -3106,9 +3081,7 @@ func TestSyncHandlerSurvivesOwnerlessPodThroughRealReconcile(t *testing.T) {
 				workloadv1alpha1.RoleLabelKey:             roleName,
 				workloadv1alpha1.RoleIDKey:                roleID,
 			},
-			// Deliberately no OwnerReferences: nothing in the informer/index
-			// layer requires one, so this state is reachable by any client
-			// with pod-create permission in the namespace.
+			// Deliberately no OwnerReferences.
 		},
 		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "c", Image: "test-image:latest"}}},
 	}
@@ -3128,8 +3101,7 @@ func TestSyncHandlerSurvivesOwnerlessPodThroughRealReconcile(t *testing.T) {
 	}, "reconciling a ModelServing with an owner-less same-labeled pod must not panic")
 	require.NoError(t, syncErr, "reconciliation must succeed despite the owner-less pod")
 
-	// Reconciling again must still succeed: the owner-less pod is skipped
-	// (continue), not left in a state that breaks subsequent reconciliation.
+	// Reconciling again must still succeed.
 	require.NotPanics(t, func() {
 		syncErr = controller.syncHandler(context.Background(), key)
 	}, "reconciliation must keep working after encountering an owner-less pod")
