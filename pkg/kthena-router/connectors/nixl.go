@@ -200,7 +200,7 @@ func cloneReqBody(reqBody map[string]interface{}) map[string]interface{} {
 
 func (n *NIXLConnector) buildPrefillRequest(c *gin.Context, req *http.Request, reqBody map[string]interface{}) *http.Request {
 	// Prepare the body for a generic prefill request.
-	preparePrefillBody(reqBody, originalRequestPath(c, req))
+	preparePrefillBody(reqBody, responsesPrefillPath(c, req))
 
 	// Add NIXL-specific parameters for KV cache transfer.
 	reqBody["kv_transfer_params"] = &KVTransferParams{

@@ -83,24 +83,25 @@ func prefillerProxy(_ *gin.Context, req *http.Request, timeout time.Duration) er
 	return nil
 }
 
-// ResponsesUpstreamError carries a non-2xx OpenAI Responses API upstream response without
+// DecodeUpstreamError carries a non-2xx decode-request upstream response without
 // writing it to the client. decoderProxy returns this instead of writing directly, so the PD
 // retry loop in proxyToPDDisaggregated can still try another prefill/decode pair: writing to
 // c.Writer immediately would make c.Writer.Written() true and stop the retry loop on the very
 // first failed attempt. The caller decides when to call WriteTo — only once retries are
 // exhausted (or not retryable) and this is the response that will actually reach the client.
-type ResponsesUpstreamError struct {
+// Currently only constructed for the OpenAI Responses API path; see decoderProxy.
+type DecodeUpstreamError struct {
 	StatusCode int
 	Header     http.Header
 	Body       []byte
 }
 
-func (e *ResponsesUpstreamError) Error() string {
+func (e *DecodeUpstreamError) Error() string {
 	return fmt.Sprintf("decode request failed with status %d", e.StatusCode)
 }
 
 // WriteTo forwards the captured upstream status, headers, and body to the client.
-func (e *ResponsesUpstreamError) WriteTo(c *gin.Context) {
+func (e *DecodeUpstreamError) WriteTo(c *gin.Context) {
 	copyResponseHeaders(c, e.Header)
 	c.Status(e.StatusCode)
 	_, _ = c.Writer.Write(e.Body)
@@ -114,7 +115,7 @@ func decoderProxy(c *gin.Context, req *http.Request, timeout time.Duration) (int
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		if isResponsesPath(originalRequestPath(c, req)) {
+		if isResponsesRequest(c, req) {
 			// Chat Completions falls through without forwarding anything here
 			// (unchanged, pre-existing behavior). For Responses, capture the
 			// upstream status/headers/body instead of writing them now: the PD
@@ -126,7 +127,7 @@ func decoderProxy(c *gin.Context, req *http.Request, timeout time.Duration) (int
 			if readErr != nil {
 				return 0, fmt.Errorf("failed to read decode error response with status %d: %w", resp.StatusCode, readErr)
 			}
-			return 0, &ResponsesUpstreamError{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: body}
+			return 0, &DecodeUpstreamError{StatusCode: resp.StatusCode, Header: resp.Header.Clone(), Body: body}
 		}
 		return 0, fmt.Errorf("decode request failed with status %d", resp.StatusCode)
 	}
@@ -141,16 +142,16 @@ func decoderProxy(c *gin.Context, req *http.Request, timeout time.Duration) (int
 	// (input_tokens/output_tokens) and streaming terminal events
 	// (response.completed/incomplete/failed, no `data: [DONE]`). Route it through
 	// the shared provider response parser instead of the Chat Completions helpers.
-	if isResponsesPath(originalRequestPath(c, req)) {
-		parser := providers.DefaultAdapter().ResponseParser(c, originalRequestPath(c, req))
+	if isResponsesRequest(c, req) {
+		parser := providers.DefaultAdapter().ResponseParser(c, "/v1/responses")
 		if stream {
-			outputTokens, err := handleResponsesStreamingResponse(c, resp, parser)
+			outputTokens, err := providers.ForwardStream(c, resp.Body, parser, nil)
 			if err != nil {
 				return outputTokens, fmt.Errorf("streaming decode interrupted: %w", err)
 			}
 			return outputTokens, nil
 		}
-		outputTokens, err := handleResponsesNonStreamingResponse(c, resp, parser)
+		outputTokens, err := providers.ForwardBody(c, resp.Body, parser, nil)
 		if err != nil {
 			return 0, fmt.Errorf("non-streaming decode interrupted: %w", err)
 		}
@@ -196,7 +197,7 @@ func preparePrefillBody(reqBody map[string]interface{}, path string) {
 
 func buildPrefillRequest(c *gin.Context, req *http.Request, modelRequest map[string]interface{}) *http.Request {
 	// In PD disaggregated mode, we need to send a prefill request to the prefill pod with non stream mode.
-	preparePrefillBody(modelRequest, originalRequestPath(c, req))
+	preparePrefillBody(modelRequest, responsesPrefillPath(c, req))
 
 	body, err := json.Marshal(modelRequest)
 	if err != nil {
@@ -214,12 +215,15 @@ func buildPrefillRequest(c *gin.Context, req *http.Request, modelRequest map[str
 
 func BuildDecodeRequest(c *gin.Context, req *http.Request, modelRequest map[string]interface{}) *http.Request {
 	var body []byte
-	if isResponsesPath(originalRequestPath(c, req)) {
-		// OpenAI Responses API: stream_options.include_usage / include_usage are
-		// Chat Completions fields and must never be injected. When the parsed
-		// request still matches the original body (no model rewrite) replay that
-		// body verbatim so opaque Responses fields are preserved byte-for-byte;
-		// otherwise re-marshal the parsed map, which changes only the model.
+	if isResponsesRequest(c, req) {
+		// Chat Completions can opt into usage reporting via stream_options.include_usage.
+		// The Responses API has no equivalent request-side flag: it always returns
+		// usage in the response body (non-streaming) or in whichever terminal event
+		// (response.completed/incomplete/failed) ends the stream, so that field must
+		// not be injected here. When the parsed request still matches the original
+		// body (no model rewrite) replay that body verbatim so opaque Responses
+		// fields are preserved byte-for-byte; otherwise re-marshal the parsed map,
+		// which changes only the model.
 		if raw, ok := unmutatedResponsesBody(c, modelRequest); ok {
 			body = raw
 		} else {
@@ -250,6 +254,31 @@ func BuildDecodeRequest(c *gin.Context, req *http.Request, modelRequest map[stri
 // It mirrors the exact-match convention used by the provider adapters.
 func isResponsesPath(p string) bool {
 	return p == "/v1/responses"
+}
+
+// isResponsesRequest reports whether req targets the OpenAI Responses API.
+// It checks both the original client-facing path and the current (possibly
+// URLRewrite-mutated) request path, so a canonical client using /v1/responses
+// directly and an HTTPRoute that rewrites a custom public path (e.g.
+// /llm/v1/responses) to canonical /v1/responses are both recognized: by the
+// time this runs, req.URL.Path reflects any URLRewrite already applied, while
+// originalRequestPath still reflects the original public path.
+func isResponsesRequest(c *gin.Context, req *http.Request) bool {
+	return isResponsesPath(originalRequestPath(c, req)) || isResponsesPath(req.URL.Path)
+}
+
+// responsesPrefillPath resolves the path preparePrefillBody uses to choose between
+// Responses (max_output_tokens) and Chat Completions (max_tokens) prefill-body
+// shaping. It defers to isResponsesRequest so every prefill-body call site — the
+// default HTTP connector via buildPrefillRequest, and NIXL/SGLang's own
+// connector-specific prefill construction — recognizes a Responses request from
+// either the original client path or a URLRewrite-mutated req.URL.Path, instead of
+// each connector re-implementing that check independently.
+func responsesPrefillPath(c *gin.Context, req *http.Request) string {
+	if isResponsesRequest(c, req) {
+		return "/v1/responses"
+	}
+	return originalRequestPath(c, req)
 }
 
 // originalRequestPath returns the client-facing request path used for wire
@@ -310,10 +339,13 @@ func unmutatedResponsesBody(c *gin.Context, modelRequest map[string]interface{})
 // AddTokenUsage adds token usage to the request body if it is not already present
 // should be used for decode requests or non PD disaggregated mode
 func AddTokenUsage(c *gin.Context, reqBody map[string]interface{}) map[string]interface{} {
-	// Responses requests already get usage natively; include_usage/stream_options
-	// are Chat Completions-only fields and must not be injected here. This guard
-	// covers the nixl/sglang PD decode paths, which call AddTokenUsage directly.
-	if c != nil && c.Request != nil && isResponsesPath(originalRequestPath(c, c.Request)) {
+	// Chat Completions can opt into usage reporting via stream_options.include_usage
+	// (streaming) or include_usage (non-streaming), injected below. The Responses
+	// API has no equivalent request-side flag and always returns usage in the
+	// response body or terminal stream event, so neither field must be injected
+	// here. This guard covers the nixl/sglang PD decode paths, which call
+	// AddTokenUsage directly.
+	if c != nil && c.Request != nil && isResponsesRequest(c, c.Request) {
 		return reqBody
 	}
 	// Check if streaming is enabled
@@ -425,57 +457,5 @@ func handleNonStreamingResponse(c *gin.Context, resp *http.Response) (int, error
 		return parsed.Usage.CompletionTokens, nil
 	}
 
-	return 0, nil
-}
-
-// handleResponsesStreamingResponse forwards an OpenAI Responses SSE stream
-// verbatim, tracking usage via parser as each line is written; see
-// providers.ResponseUsageParser for how the terminal event is detected.
-func handleResponsesStreamingResponse(c *gin.Context, resp *http.Response, parser providers.ResponseUsageParser) (int, error) {
-	reader := bufio.NewReader(resp.Body)
-	var streamErr error
-	c.Stream(func(w io.Writer) bool {
-		line, err := reader.ReadBytes('\n')
-		if len(line) > 0 {
-			parser.ParseStreamLine(string(line))
-			if _, writeErr := w.Write(line); writeErr != nil {
-				klog.Errorf("error writing stream body: %v", writeErr)
-				streamErr = writeErr
-				return false
-			}
-			parser.RecordStreamLineWritten(string(line))
-		}
-		if err != nil {
-			if err != io.EOF {
-				klog.Errorf("error reading stream body: %v", err)
-				streamErr = err
-			}
-			return false
-		}
-		return true
-	})
-
-	if usage, ok := parser.FinalStreamUsage(); ok {
-		klog.V(4).Infof("Parsed usage: %+v", usage)
-		return usage.CompletionTokens, streamErr
-	}
-	return 0, streamErr
-}
-
-// handleResponsesNonStreamingResponse forwards a non-streaming OpenAI Responses
-// body verbatim, extracting usage via parser.ParseBody.
-func handleResponsesNonStreamingResponse(c *gin.Context, resp *http.Response, parser providers.ResponseUsageParser) (int, error) {
-	var buf bytes.Buffer
-	teeReader := io.TeeReader(resp.Body, &buf)
-
-	if _, err := io.Copy(c.Writer, teeReader); err != nil {
-		klog.Errorf("copy response to downstream failed: %v", err)
-		return 0, err
-	}
-
-	if usage, ok := parser.ParseBody(buf.Bytes()); ok {
-		klog.V(4).Infof("Parsed usage: %+v", usage)
-		return usage.CompletionTokens, nil
-	}
 	return 0, nil
 }

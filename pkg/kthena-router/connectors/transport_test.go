@@ -380,6 +380,38 @@ func TestBuildPrefillRequestResponsesAPI(t *testing.T) {
 	assert.Equal(t, "resp_1", parsed["previous_response_id"], "opaque fields preserved")
 }
 
+// TestBuildPrefillRequestResponsesAPIRewrittenToCanonicalPath covers the opposite
+// URLRewrite direction: the original client-facing path is custom, but
+// req.URL.Path has already been rewritten to the canonical "/v1/responses"
+// upstream path by the time buildPrefillRequest runs.
+func TestBuildPrefillRequestResponsesAPIRewrittenToCanonicalPath(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("POST", "/llm/v1/responses", nil)
+	accessCtx := accesslog.NewAccessLogContext("req-1", http.MethodPost, "/llm/v1/responses", "HTTP/1.1", "")
+	c.Set(accesslog.AccessLogContextKey, accessCtx)
+
+	req := httptest.NewRequest("POST", "/v1/responses", nil)
+	modelRequest := map[string]interface{}{
+		"model": "m", "input": "hi", "stream": true,
+	}
+
+	result := buildPrefillRequest(c, req, modelRequest)
+	require.NotNil(t, result)
+
+	body, err := io.ReadAll(result.Body)
+	require.NoError(t, err)
+
+	var parsed map[string]interface{}
+	require.NoError(t, json.Unmarshal(body, &parsed))
+
+	assert.Equal(t, float64(1), parsed["max_output_tokens"], "Responses output cap must apply "+
+		"once req.URL.Path is rewritten to canonical /v1/responses")
+	assert.NotContains(t, parsed, "max_tokens")
+}
+
 func TestAddTokenUsageResponsesAPINoInjection(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -409,6 +441,25 @@ func TestAddTokenUsageResponsesAPINoInjection(t *testing.T) {
 		value, exists := c.Get(common.TokenUsageKey)
 		assert.True(t, exists)
 		assert.Equal(t, true, value)
+	})
+
+	// Opposite URLRewrite direction: a custom public path rewritten to the
+	// canonical "/v1/responses" upstream path. stream_options/include_usage must
+	// still not be injected, even though the original client-facing path alone
+	// does not look like a Responses request.
+	t.Run("responses request is not mutated after rewrite to canonical path", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(w)
+		c.Request = httptest.NewRequest("POST", "/v1/responses", nil)
+		accessCtx := accesslog.NewAccessLogContext("req-1", http.MethodPost, "/llm/v1/responses", "HTTP/1.1", "")
+		c.Set(accesslog.AccessLogContextKey, accessCtx)
+
+		out := AddTokenUsage(c, map[string]interface{}{"model": "m", "input": "hi", "stream": true})
+
+		assert.NotContains(t, out, "stream_options")
+		assert.NotContains(t, out, "include_usage")
+		_, tokenUsageSet := c.Get(common.TokenUsageKey)
+		assert.False(t, tokenUsageSet)
 	})
 }
 
@@ -1008,7 +1059,7 @@ func TestDecoderProxyResponsesAPIStreaming(t *testing.T) {
 // concern that decoderProxy wrote a non-2xx Responses response to c.Writer immediately,
 // which made c.Writer.Written() true and stopped proxyToPDDisaggregated's retry loop from
 // trying another prefill/decode pair on the very first failed attempt. decoderProxy must
-// instead return the upstream status/headers/body via ResponsesUpstreamError without writing
+// instead return the upstream status/headers/body via DecodeUpstreamError without writing
 // anything, leaving the retry decision (and the eventual write) to the caller.
 func TestDecoderProxyResponsesAPINonStreamingErrorDoesNotWritePrematurely(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -1039,8 +1090,8 @@ func TestDecoderProxyResponsesAPINonStreamingErrorDoesNotWritePrematurely(t *tes
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Empty(t, w.Body.String())
 
-	var respErr *ResponsesUpstreamError
-	require.ErrorAs(t, err, &respErr, "a Responses non-2xx must be returned as *ResponsesUpstreamError so the caller can retry")
+	var respErr *DecodeUpstreamError
+	require.ErrorAs(t, err, &respErr, "a Responses non-2xx must be returned as *DecodeUpstreamError so the caller can retry")
 	assert.Equal(t, http.StatusBadRequest, respErr.StatusCode)
 	assert.Equal(t, errBody, string(respErr.Body))
 	assert.Equal(t, "yes", respErr.Header.Get("X-Upstream"))
@@ -1085,6 +1136,42 @@ func TestDecoderProxyResponsesAPIUsesOriginalPathAfterURLRewrite(t *testing.T) {
 
 	assert.Equal(t, 7, outputTokens, "Responses usage parsing must apply based on the original "+
 		"client path even though req.URL.Path was rewritten away from /v1/responses")
+	assert.Equal(t, respBody, w.Body.String())
+}
+
+// TestDecoderProxyResponsesAPIRecognizesRewrittenCanonicalPath covers the opposite
+// URLRewrite direction: a custom public path (e.g. /llm/v1/responses) rewritten by
+// an HTTPRoute to the canonical upstream path "/v1/responses". The original
+// client-facing path alone no longer identifies this as a Responses request, so
+// decoderProxy must also recognize req.URL.Path once it has been rewritten to
+// "/v1/responses".
+func TestDecoderProxyResponsesAPIRecognizesRewrittenCanonicalPath(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	respBody := `{"id":"resp_1","usage":{"input_tokens":11,"output_tokens":7,"total_tokens":18}}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(respBody))
+	}))
+	defer server.Close()
+
+	w := CreateTestResponseRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest("POST", "/llm/v1/responses", nil)
+	// The original client-facing path is custom; only the access-log context
+	// records it, matching what AccessLogMiddleware captures before URLRewrite.
+	accessCtx := accesslog.NewAccessLogContext("req-1", http.MethodPost, "/llm/v1/responses", "HTTP/1.1", "")
+	c.Set(accesslog.AccessLogContextKey, accessCtx)
+
+	// req.URL.Path reflects the HTTPRoute URLRewrite to the canonical path.
+	testReq, err := http.NewRequest("POST", server.URL+"/v1/responses", bytes.NewBufferString(`{"model":"m","input":"hi"}`))
+	require.NoError(t, err)
+
+	outputTokens, err := decoderProxy(c, testReq, 0)
+	require.NoError(t, err)
+
+	assert.Equal(t, 7, outputTokens, "Responses usage parsing must apply once req.URL.Path is "+
+		"rewritten to canonical /v1/responses, even though the original public path was custom")
 	assert.Equal(t, respBody, w.Body.String())
 }
 

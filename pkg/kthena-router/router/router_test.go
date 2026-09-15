@@ -2025,6 +2025,90 @@ func TestRouter_HandlerFunc_Responses_InferencePool_URLRewrite(t *testing.T) {
 	assert.Equal(t, 7, accessCtx.OutputTokens, "usage.output_tokens must still be parsed as Responses usage")
 }
 
+// TestRouter_HandlerFunc_Responses_InferencePool_URLRewrite_CustomPublicPath covers the
+// opposite URLRewrite direction from the test above: a custom public path (e.g.
+// /llm/v1/responses) rewritten by an HTTPRoute to the canonical upstream path
+// "/v1/responses". The original client-facing path alone no longer identifies this as
+// a Responses request, so the response parser selection must also recognize the
+// rewritten path once it matches "/v1/responses".
+func TestRouter_HandlerFunc_Responses_InferencePool_URLRewrite_CustomPublicPath(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	body := responsesSSE("response.completed", responsesUsageJSON)
+	var receivedPath string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedPath = r.URL.Path
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, body)
+	}))
+	defer backend.Close()
+	store := datastore.New()
+	router := NewRouter(store, "../scheduler/testdata/configmap.yaml")
+
+	backendURL, _ := url.Parse(backend.URL)
+	backendPort, _ := strconv.Atoi(backendURL.Port())
+	pool := &inferencev1.InferencePool{
+		ObjectMeta: v1.ObjectMeta{Name: "resp-pool-rewrite-custom", Namespace: "default"},
+		Spec: inferencev1.InferencePoolSpec{
+			TargetPorts: []inferencev1.Port{{Number: inferencev1.PortNumber(backendPort)}},
+			Selector: inferencev1.LabelSelector{MatchLabels: map[inferencev1.LabelKey]inferencev1.LabelValue{
+				"app": "resp-pool-rewrite-custom",
+			}},
+			EndpointPickerRef: inferencev1.EndpointPickerRef{Name: "picker"},
+		},
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: v1.ObjectMeta{Name: "resp-pool-rewrite-custom-pod", Namespace: "default", Labels: map[string]string{"app": "resp-pool-rewrite-custom"}},
+		Status:     corev1.PodStatus{PodIP: backendURL.Hostname(), Phase: corev1.PodRunning},
+	}
+	pathType := gatewayv1.PathMatchPathPrefix
+	prefix := "/llm/v1"
+	parentKind := gatewayv1.Kind("Gateway")
+	backendGroup := inferencePoolBackendGroup
+	backendKind := inferencePoolBackendKind
+	rewriteType := gatewayv1.FullPathHTTPPathModifier
+	rewrittenPath := "/v1/responses"
+	route := &gatewayv1.HTTPRoute{
+		ObjectMeta: v1.ObjectMeta{Name: "resp-pool-rewrite-custom-route", Namespace: "default"},
+		Spec: gatewayv1.HTTPRouteSpec{
+			CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{{Name: "gw", Kind: &parentKind}}},
+			Rules: []gatewayv1.HTTPRouteRule{{
+				Matches: []gatewayv1.HTTPRouteMatch{{Path: &gatewayv1.HTTPPathMatch{Type: &pathType, Value: &prefix}}},
+				Filters: []gatewayv1.HTTPRouteFilter{{
+					Type: gatewayv1.HTTPRouteFilterURLRewrite,
+					URLRewrite: &gatewayv1.HTTPURLRewriteFilter{
+						Path: &gatewayv1.HTTPPathModifier{Type: rewriteType, ReplaceFullPath: &rewrittenPath},
+					},
+				}},
+				BackendRefs: []gatewayv1.HTTPBackendRef{{BackendRef: gatewayv1.BackendRef{BackendObjectReference: gatewayv1.BackendObjectReference{
+					Group: &backendGroup, Kind: &backendKind, Name: "resp-pool-rewrite-custom",
+				}}}},
+			}},
+		},
+	}
+	assert.NoError(t, store.AddOrUpdateInferencePool(pool))
+	assert.NoError(t, store.AddOrUpdatePod(pod, nil))
+	assert.NoError(t, store.AddOrUpdateHTTPRoute(route))
+
+	w := connectors.CreateTestResponseRecorder()
+	c, _ := gin.CreateTestContext(w)
+	// The public path is custom; the HTTPRoute above rewrites it to canonical /v1/responses.
+	c.Request, _ = http.NewRequest(http.MethodPost, "/llm/v1/responses", bytes.NewBufferString(`{"model":"pool-model","input":"hi","stream":true}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	c.Set(GatewayKey, "default/gw")
+	accessCtx := accesslog.NewAccessLogContext("resp-pool-rewrite-custom", http.MethodPost, c.Request.URL.Path, c.Request.Proto, "")
+	c.Set(accesslog.AccessLogContextKey, accessCtx)
+
+	router.HandlerFunc()(c)
+
+	assert.Equal(t, rewrittenPath, receivedPath, "the backend must receive the rewritten canonical path")
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, body, w.Body.String(), "Responses SSE is still forwarded verbatim despite the custom public path")
+	assert.NotContains(t, w.Body.String(), "[DONE]")
+	assert.Equal(t, 7, accessCtx.OutputTokens, "usage.output_tokens must be parsed as Responses usage "+
+		"even though the original public path was custom")
+}
+
 func TestRouter_HandlerFunc_Responses_Disaggregated(t *testing.T) {
 	setup := func(t *testing.T, backendHandler http.Handler) (*Router, datastore.Store, *httptest.Server) {
 		t.Helper()
@@ -3751,14 +3835,14 @@ func TestRouter_ProxyToPDDisaggregated_RetryBehavior(t *testing.T) {
 	}
 }
 
-// TestRouter_ProxyToPDDisaggregated_ResponsesUpstreamError covers the review concern that a
+// TestRouter_ProxyToPDDisaggregated_DecodeUpstreamError covers the review concern that a
 // non-2xx Responses upstream response, if written to c.Writer immediately, would make
 // c.Writer.Written() true and stop the retry loop above from trying another prefill/decode
-// pair on the very first failed attempt. connectors.ResponsesUpstreamError lets decoderProxy
+// pair on the very first failed attempt. connectors.DecodeUpstreamError lets decoderProxy
 // report such a response without writing it, so this verifies the retry loop actually uses
 // that: it keeps retrying while the error is only a captured-but-unwritten
-// ResponsesUpstreamError, and forwards the real upstream response once retries are exhausted.
-func TestRouter_ProxyToPDDisaggregated_ResponsesUpstreamError(t *testing.T) {
+// DecodeUpstreamError, and forwards the real upstream response once retries are exhausted.
+func TestRouter_ProxyToPDDisaggregated_DecodeUpstreamError(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	pod1 := &corev1.Pod{
@@ -3786,7 +3870,7 @@ func TestRouter_ProxyToPDDisaggregated_ResponsesUpstreamError(t *testing.T) {
 			if mockConnector.calls.Load() == 1 {
 				// First pod pair: a genuine non-2xx Responses response, captured but not
 				// written yet. c.Writer.Written() must stay false so the loop retries.
-				return 0, &connectors.ResponsesUpstreamError{
+				return 0, &connectors.DecodeUpstreamError{
 					StatusCode: http.StatusServiceUnavailable,
 					Header:     http.Header{},
 					Body:       []byte(`{"error":"pod 1 overloaded"}`),
@@ -3824,7 +3908,7 @@ func TestRouter_ProxyToPDDisaggregated_ResponsesUpstreamError(t *testing.T) {
 		mockConnector.proxyHandler = func(c *gin.Context, reqBody map[string]interface{}, prefillAddr, decodeAddr string, hooks *connectors.OnFlightHooks) (int, error) {
 			// Every attempt fails with a genuine (not connection-level) upstream error.
 			n := mockConnector.calls.Load()
-			return 0, &connectors.ResponsesUpstreamError{
+			return 0, &connectors.DecodeUpstreamError{
 				StatusCode: http.StatusServiceUnavailable,
 				Header:     http.Header{"X-Upstream-Pod": []string{fmt.Sprintf("pod-%d", n)}},
 				Body:       []byte(fmt.Sprintf(`{"error":"pod %d overloaded"}`, n)),
@@ -3837,7 +3921,7 @@ func TestRouter_ProxyToPDDisaggregated_ResponsesUpstreamError(t *testing.T) {
 
 		err := router.proxyToPDDisaggregated(c, c.Request, ctx, mockConnector, ModelRequest{"model": "responses-model"}, 8000, 2*time.Second)
 
-		var respErr *connectors.ResponsesUpstreamError
+		var respErr *connectors.DecodeUpstreamError
 		assert.ErrorAs(t, err, &respErr)
 		assert.Equal(t, int32(2), mockConnector.calls.Load())
 		// The client must see the LAST attempt's real upstream response, not a generic 500.
