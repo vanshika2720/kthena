@@ -195,8 +195,8 @@ func newHomogeneousPolicy(minReplicas, maxReplicas int32) *registryv1.Autoscalin
 	}
 }
 
-// newHeterogeneousPolicy builds a policy with a HeterogeneousTarget whose second param uses the
-// given replica bounds; the first param is kept valid so it never contributes an error.
+// newHeterogeneousPolicy builds a HeterogeneousTarget policy; only the second
+// param uses the given replica bounds, the first stays valid.
 func newHeterogeneousPolicy(secondMinReplicas, secondMaxReplicas int32) *registryv1.AutoscalingPolicy {
 	return &registryv1.AutoscalingPolicy{
 		ObjectMeta: metav1.ObjectMeta{Name: "heterogeneous-policy", Namespace: "default"},
@@ -281,9 +281,6 @@ func TestValidateAutoscalingPolicy_ReplicaRangeValidation(t *testing.T) {
 			allowed, msg := validator.validateAutoscalingPolicy(tt.policy)
 			assert.Equal(t, tt.wantAllowed, allowed, msg)
 
-			// validateTarget returns the structured field.ErrorList before it is
-			// flattened into the message string; assert on it directly so the
-			// test verifies the reported field path, not just the message text.
 			gotTargetErrs := validator.validateTarget(tt.policy)
 			if len(tt.wantTargetErrs) == 0 {
 				assert.Empty(t, gotTargetErrs)
@@ -352,8 +349,6 @@ func TestValidateAutoscalingPolicy_DisaggregatedTarget(t *testing.T) {
 	assert.Contains(t, msg, "minReplicas must be <= maxReplicas")
 	assert.Contains(t, msg, "metricSources key must match an effective metric name")
 
-	// Same field-path check as the homogeneous/heterogeneous targets: the reported
-	// error must point at the specific role's minReplicas, not just say so in prose.
 	assert.Contains(t, validator.validateDisaggregatedTarget(invalidPolicy), field.Invalid(
 		field.NewPath("spec").Child("disaggregatedTarget").Child("roles").Key("prefill").Child("minReplicas"),
 		int32(9),
