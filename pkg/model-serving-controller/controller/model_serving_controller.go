@@ -37,7 +37,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -614,7 +613,7 @@ func (c *ModelServingController) Run(ctx context.Context, workers int) {
 
 	klog.Info("start modelServing controller")
 	for i := 0; i < workers; i++ {
-		go wait.UntilWithContext(ctx, c.worker, time.Second)
+		go c.worker(ctx)
 	}
 	<-ctx.Done()
 	klog.Info("shut down modelServing controller")
